@@ -23,12 +23,18 @@ limitations under the License.
 
 #include <functional>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "anthropic.pb.h"
 #include "chat.pb.h"
+#include "common/xllm/status.h"
 #include "completion.pb.h"
 
 namespace xllm_service {
+
+std::pair<int32_t, std::string> serialize_http_error(const llm::Status& status,
+                                                     bool anthropic);
 
 // Interface for the classes that are used to handle grpc requests.
 class CallData {
@@ -128,7 +134,7 @@ class StreamCallData : public CallData {
     return true;
   }
 
-  bool write_and_finish(Response& response) {
+  bool write_and_finish(const Response& response) {
     butil::IOBufAsZeroCopyOutputStream json_output(
         &controller_->response_attachment());
     std::string err_msg;
@@ -159,6 +165,22 @@ class StreamCallData : public CallData {
     return true;
   }
 
+  bool finish_with_error(const llm::Status& status) {
+    constexpr bool kAnthropic =
+        std::is_same_v<Response, ::xllm::proto::AnthropicMessagesResponse>;
+    const auto [http_status, body] = serialize_http_error(status, kAnthropic);
+    if (!stream_) {
+      controller_->http_response().set_status_code(http_status);
+      controller_->http_response().set_content_type("application/json");
+      return write_and_finish(body);
+    }
+    if constexpr (kAnthropic) {
+      finished_ = true;
+      return write("event: error\ndata: " + body + "\n\n");
+    }
+    return write("data: " + body + "\n\n") && finish();
+  }
+
   // For stream response
   bool write(const butil::IOBuf& attachment_iobuf) {
     if (trace_callback_) {
@@ -183,7 +205,7 @@ class StreamCallData : public CallData {
     return true;
   }
 
-  bool write(Response& response) {
+  bool write(const Response& response) {
     io_buf_.clear();
     io_buf_.append("data: ");
     butil::IOBufAsZeroCopyOutputStream json_output(&io_buf_);
@@ -224,7 +246,7 @@ class StreamCallData : public CallData {
   bool finished() { return finished_; }
 
  protected:
-  bool serialize_response(Response& response,
+  bool serialize_response(const Response& response,
                           std::string* json,
                           std::string* error) {
     return json2pb::ProtoMessageToJson(response, json, json_options_, error);
@@ -261,8 +283,8 @@ class ChatCallData final : public StreamCallData<::xllm::proto::ChatRequest,
   using Base::write;
   using Base::write_and_finish;
 
-  bool write_and_finish(::xllm::proto::ChatResponse& response);
-  bool write(::xllm::proto::ChatResponse& response);
+  bool write_and_finish(const ::xllm::proto::ChatResponse& response);
+  bool write(const ::xllm::proto::ChatResponse& response);
 };
 
 class AnthropicCallData

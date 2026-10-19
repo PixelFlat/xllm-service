@@ -19,6 +19,8 @@ limitations under the License.
 #include <absl/time/time.h>
 #include <brpc/closure_guard.h>
 
+#include <utility>
+
 #include "common/types.h"
 #include "common/utils.h"
 #include "common/xllm/status.h"
@@ -52,9 +54,8 @@ std::vector<std::string> XllmRpcServiceImpl::get_static_prefill_list(
   return scheduler_->get_static_prefill_list(instance_name);
 }
 
-bool XllmRpcServiceImpl::handle_generation(
-    const llm::RequestOutput& request_output) {
-  return scheduler_->handle_generation(request_output);
+bool XllmRpcServiceImpl::handle_generation(llm::RequestOutput request_output) {
+  return scheduler_->handle_generation(std::move(request_output));
 }
 
 XllmRpcService::XllmRpcService(const Options& options, Scheduler* scheduler) {
@@ -156,8 +157,8 @@ void XllmRpcService::Generations(google::protobuf::RpcController* cntl_base,
       status->set_ok(false);
       continue;
     }
-    status->set_ok(
-        xllm_rpc_service_impl_->handle_generation(conversion.output.value()));
+    status->set_ok(xllm_rpc_service_impl_->handle_generation(
+        std::move(conversion.output.value())));
   }
 }
 

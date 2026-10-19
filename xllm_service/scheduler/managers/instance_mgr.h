@@ -74,7 +74,7 @@ class InstanceMgr final {
                               const proto::LatencyMetrics& latency_metrics);
 
   // update request metrics under different actions
-  void update_request_metrics(std::shared_ptr<Request> request,
+  void update_request_metrics(const std::shared_ptr<Request>& request,
                               RequestAction action);
 
   // select instances based on the SLO

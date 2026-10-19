@@ -15,57 +15,23 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
-#include <mutex>
-#include <unordered_map>
-#include <unordered_set>
+#include <string>
 
 #include "common/call_data.h"
-#include "common/threadpool.h"
-#include "common/types.h"
 #include "common/xllm/output.h"
-#include "common/xllm/status.h"
-
-namespace xllm {
-class StreamOutputParser;
-}
 
 namespace xllm_service {
 
 class AnthropicStreamEncoder;
 
-struct ChatStreamParseState {
-  std::unordered_set<size_t> first_message_sent;
-  std::shared_ptr<xllm::StreamOutputParser> stream_parser;
-};
-
 class ResponseHandler final {
  public:
-  ResponseHandler() = default;
-  ~ResponseHandler() = default;
-
-  std::shared_ptr<ChatStreamParseState> create_chat_stream_parse_state(
-      const std::vector<JsonTool>& tools,
-      const std::string& model,
-      const std::string& tool_call_parser = "",
-      const std::string& reasoning_parser = "",
-      bool force_reasoning = false);
-
-  bool send_delta_to_client(
-      std::shared_ptr<ChatCallData> call_data,
-      bool include_usage,
-      int64_t created_time,
-      const std::string& model,
-      const llm::RequestOutput& output,
-      std::shared_ptr<ChatStreamParseState> stream_state = nullptr);
+  bool send_delta_to_client(std::shared_ptr<ChatCallData> call_data,
+                            const llm::RequestOutput& output);
   bool send_result_to_client(std::shared_ptr<ChatCallData> call_data,
-                             int64_t created_time,
-                             const std::string& model,
-                             const llm::RequestOutput& req_output,
-                             const std::vector<JsonTool>& tools = {},
-                             const std::string& tool_call_parser = "",
-                             const std::string& reasoning_parser = "",
-                             bool force_reasoning = false);
+                             const llm::RequestOutput& output);
 
   bool send_delta_to_client(std::shared_ptr<CompletionCallData> call_data,
                             bool include_usage,
@@ -75,21 +41,14 @@ class ResponseHandler final {
   bool send_result_to_client(std::shared_ptr<CompletionCallData> call_data,
                              int64_t created_time,
                              const std::string& model,
-                             const llm::RequestOutput& req_output);
+                             const llm::RequestOutput& output);
 
-  bool send_delta_to_client(
-      std::shared_ptr<AnthropicCallData> call_data,
-      const std::string& model,
-      const llm::RequestOutput& output,
-      AnthropicStreamEncoder& encoder,
-      std::shared_ptr<xllm::StreamOutputParser> stream_parser = nullptr);
+  bool send_delta_to_client(std::shared_ptr<AnthropicCallData> call_data,
+                            const llm::RequestOutput& output,
+                            AnthropicStreamEncoder& encoder);
   bool send_result_to_client(std::shared_ptr<AnthropicCallData> call_data,
                              const std::string& model,
-                             const llm::RequestOutput& req_output,
-                             const std::vector<JsonTool>& tools = {},
-                             const std::string& tool_call_parser = "",
-                             const std::string& reasoning_parser = "",
-                             bool force_reasoning = false);
+                             const llm::RequestOutput& output);
 };
 
 }  // namespace xllm_service

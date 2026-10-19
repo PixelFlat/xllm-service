@@ -75,10 +75,6 @@ DECLARE_int32(target_ttft);
 
 DECLARE_int32(target_tpot);
 
-DECLARE_string(tool_call_parser);
-
-DECLARE_string(reasoning_parser);
-
 DECLARE_int32(readiness_check_interval_s);
 
 DECLARE_string(default_backend_type);

@@ -74,15 +74,16 @@ class Scheduler final {
                                          InstanceType type);
 
   // handle generations from prefill/decode instance
-  bool handle_generation(const llm::RequestOutput& request_output);
+  bool handle_generation(llm::RequestOutput request_output);
 
-  // update request metrics for prefill finished request
-  void update_request_metrics(std::shared_ptr<Request> request,
+  // Returns true only for the first successful output completing Prefill.
+  // The caller holds request_mutex_ while changing request progress.
+  bool update_request_metrics(const std::shared_ptr<Request>& request,
                               bool finished_on_prefill_instance);
 
   // update token latency metrics
-  void update_token_latency_metrics(std::shared_ptr<Request> request,
-                                    bool finished_on_prefill_instance);
+  void update_token_latency_metrics(const std::shared_ptr<Request>& request,
+                                    bool first_token);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
@@ -110,10 +111,6 @@ class Scheduler final {
 
   // chat template instance
   std::unique_ptr<ChatTemplate> chat_template_;
-
-  // Parser formats resolved once from config.json model_type.
-  std::string tool_call_parser_format_;
-  std::string reasoning_parser_format_;
 
   std::shared_ptr<EtcdClient> etcd_client_;
 

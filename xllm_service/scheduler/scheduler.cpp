@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "scheduler/scheduler.h"
 
+#include <utility>
+
 #include "chat_template/deepseek_v4_cpp_chat_template.h"
 #include "chat_template/model_type.h"
 #include "common/metrics.h"
@@ -25,7 +27,7 @@ limitations under the License.
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
-#include "scheduler/xllm_chat_parse_bridge.h"
+#include "scheduler/request_metrics.h"
 #include "tokenizer/tokenizer_factory.h"
 
 namespace {
@@ -64,13 +66,6 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
         break;
     }
   }
-
-  const auto parser_formats =
-      resolve_chat_parser_formats_with_xllm(model_type.value_or(""),
-                                            options_.tool_call_parser(),
-                                            options_.reasoning_parser());
-  tool_call_parser_format_ = parser_formats.tool_call_parser;
-  reasoning_parser_format_ = parser_formats.reasoning_parser;
 
   const std::string etcd_username =
       utils::get_optional_string_env(kEtcdUsernameEnvVar).value_or("");
@@ -351,62 +346,24 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
     }
 
     request->latest_generate_time = absl::Now();
-    auto tools_for_parse =
-        (request->tool_choice == "none" ? std::vector<JsonTool>{}
-                                        : request->tools);
-    const bool force_reasoning = get_enable_thinking_from_request(
-        request->chat_template_kwargs, reasoning_parser_format_);
-    std::shared_ptr<ChatStreamParseState> stream_state;
-    if (request->stream) {
-      stream_state = response_handler_.create_chat_stream_parse_state(
-          tools_for_parse,
-          request->model,
-          tool_call_parser_format_,
-          reasoning_parser_format_,
-          force_reasoning);
-    }
-
     request->call_data = call_data;
     request->output_callback =
-        [this,
-         call_data,
-         model = request->model,
-         stream = request->stream,
-         include_usage = request->include_usage,
-         tools = std::move(tools_for_parse),
-         tool_call_parser = tool_call_parser_format_,
-         reasoning_parser = reasoning_parser_format_,
-         force_reasoning,
-         stream_state = std::move(stream_state),
-         service_request_id = request->service_request_id,
-         created_time = absl::ToUnixSeconds(request->latest_generate_time)](
+        [this, call_data, stream = request->stream](
             const llm::RequestOutput& req_output) mutable -> bool {
       if (req_output.status.has_value()) {
         const auto& status = req_output.status.value();
         if (!status.ok()) {
-          return call_data->finish_with_error(status.message());
+          return call_data->finish_with_error(status);
         }
       }
 
-      if (stream) {
-        return response_handler_.send_delta_to_client(call_data,
-                                                      include_usage,
-                                                      created_time,
-                                                      model,
-                                                      req_output,
-                                                      stream_state);
-      } else if (!req_output.finished_on_prefill_instance) {
-        // for non-stream request, only send final result from decode instance
-        return response_handler_.send_result_to_client(call_data,
-                                                       created_time,
-                                                       model,
-                                                       req_output,
-                                                       tools,
-                                                       tool_call_parser,
-                                                       reasoning_parser,
-                                                       force_reasoning);
+      if (req_output.finished_on_prefill_instance) {
+        return true;
       }
-      return true;
+      if (stream) {
+        return response_handler_.send_delta_to_client(call_data, req_output);
+      }
+      return response_handler_.send_result_to_client(call_data, req_output);
     };
     requests_.emplace(request->service_request_id, request);
     COUNTER_INC(server_request_in_total);
@@ -435,22 +392,9 @@ bool Scheduler::record_new_request(std::shared_ptr<AnthropicCallData> call_data,
     }
 
     request->latest_generate_time = absl::Now();
-    auto tools_for_parse =
-        (request->tool_choice == "none" ? std::vector<JsonTool>{}
-                                        : request->tools);
-    const bool force_reasoning = get_enable_thinking_from_request(
-        request->chat_template_kwargs, reasoning_parser_format_);
     auto stream_encoder =
         request->stream
             ? std::make_shared<AnthropicStreamEncoder>(request->model)
-            : nullptr;
-    auto stream_parser =
-        request->stream
-            ? create_stream_output_parser_with_xllm(tools_for_parse,
-                                                    request->model,
-                                                    tool_call_parser_format_,
-                                                    reasoning_parser_format_,
-                                                    force_reasoning)
             : nullptr;
     request->call_data = call_data;
     request->output_callback =
@@ -458,33 +402,23 @@ bool Scheduler::record_new_request(std::shared_ptr<AnthropicCallData> call_data,
          call_data,
          model = request->model,
          stream = request->stream,
-         stream_encoder,
-         stream_parser,
-         tools = std::move(tools_for_parse),
-         tool_call_parser = tool_call_parser_format_,
-         reasoning_parser = reasoning_parser_format_,
-         force_reasoning](
-            const llm::RequestOutput& req_output) mutable -> bool {
+         stream_encoder](const llm::RequestOutput& req_output) mutable -> bool {
       if (req_output.status.has_value()) {
         const auto& status = req_output.status.value();
         if (!status.ok()) {
-          return call_data->finish_with_error(status.message());
+          return call_data->finish_with_error(status);
         }
       }
 
+      if (req_output.finished_on_prefill_instance) {
+        return true;
+      }
       if (stream) {
         return response_handler_.send_delta_to_client(
-            call_data, model, req_output, *stream_encoder, stream_parser);
-      } else if (!req_output.finished_on_prefill_instance) {
-        return response_handler_.send_result_to_client(call_data,
-                                                       model,
-                                                       req_output,
-                                                       tools,
-                                                       tool_call_parser,
-                                                       reasoning_parser,
-                                                       force_reasoning);
+            call_data, req_output, *stream_encoder);
       }
-      return true;
+      return response_handler_.send_result_to_client(
+          call_data, model, req_output);
     };
     requests_.emplace(request->service_request_id, request);
     COUNTER_INC(server_request_in_total);
@@ -527,7 +461,7 @@ bool Scheduler::record_new_request(
       if (req_output.status.has_value()) {
         const auto& status = req_output.status.value();
         if (!status.ok()) {
-          return call_data->finish_with_error(status.message());
+          return call_data->finish_with_error(status);
         }
       }
 
@@ -564,16 +498,10 @@ void Scheduler::finish_request(const std::string& service_request_id,
     auto it = requests_.find(service_request_id);
     if (it != requests_.end()) {
       request = it->second;
+      instance_mgr_->update_request_metrics(
+          request,
+          error ? RequestAction::CANCEL : RequestAction::FINISH_DECODE);
       requests_.erase(it);
-    }
-  }
-
-  if (request != nullptr) {
-    if (error) {
-      instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
-    } else {
-      instance_mgr_->update_request_metrics(request,
-                                            RequestAction::FINISH_DECODE);
     }
   }
 
@@ -587,48 +515,52 @@ void Scheduler::clear_requests_on_failed_instance(
     const std::string& instance_name,
     const std::string& incarnation_id,
     InstanceType type) {
-  std::vector<std::string> cleared_request_ids;
-  std::lock_guard<std::mutex> lock(request_mutex_);
-  for (auto it = requests_.begin(); it != requests_.end();) {
-    const bool clear_prefill =
-        ((type == InstanceType::DEFAULT || type == InstanceType::PREFILL) &&
-         it->second->routing.prefill_name == instance_name &&
-         it->second->prefill_incarnation_id == incarnation_id &&
-         !it->second->prefill_stage_finished);
-    const bool clear_decode =
-        (type == InstanceType::DECODE &&
-         it->second->routing.decode_name == instance_name &&
-         it->second->decode_incarnation_id == incarnation_id);
-    if (clear_prefill || clear_decode) {
-      auto service_request_id = it->second->service_request_id;
-      llm::RequestOutput req_output;
-      req_output.status = llm::Status(llm::StatusCode::CANCELLED,
-                                      "Instance is failed and deleted");
-      // call request callback
-      it->second->output_callback(req_output);
-      LOG(INFO) << "Clear request on failed instance: " << instance_name
-                << ", incarnation_id: " << incarnation_id
-                << ", service_request_id: " << service_request_id;
-      cleared_request_ids.emplace_back(service_request_id);
+  std::vector<std::shared_ptr<Request>> cleared_requests;
+  {
+    std::lock_guard<std::mutex> lock(request_mutex_);
+    for (auto it = requests_.begin(); it != requests_.end();) {
+      const auto& request = it->second;
+      const bool clear_prefill =
+          ((type == InstanceType::DEFAULT || type == InstanceType::PREFILL) &&
+           request->routing.prefill_name == instance_name &&
+           request->prefill_incarnation_id == incarnation_id &&
+           !request->prefill_stage_finished);
+      const bool clear_decode =
+          (type == InstanceType::DECODE &&
+           request->routing.decode_name == instance_name &&
+           request->decode_incarnation_id == incarnation_id);
+      if (!clear_prefill && !clear_decode) {
+        ++it;
+        continue;
+      }
+      instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
+      cleared_requests.emplace_back(request);
       it = requests_.erase(it);
-    } else {
-      ++it;
     }
   }
-
-  if (!cleared_request_ids.empty()) {
+  if (!cleared_requests.empty()) {
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    for (const auto& service_request_id : cleared_request_ids) {
-      remote_requests_output_thread_map_.erase(service_request_id);
+    for (const auto& request : cleared_requests) {
+      remote_requests_output_thread_map_.erase(request->service_request_id);
     }
+  }
+  for (const auto& request : cleared_requests) {
+    llm::RequestOutput output;
+    output.service_request_id = request->service_request_id;
+    output.status = llm::Status(llm::StatusCode::CANCELLED,
+                                "Instance is failed and deleted");
+    request->output_callback(output);
+    LOG(INFO) << "Clear request on failed instance: " << instance_name
+              << ", incarnation_id: " << incarnation_id
+              << ", service_request_id: " << request->service_request_id;
   }
 }
 
-bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
-  bool finished_on_prefill_instance =
+bool Scheduler::handle_generation(llm::RequestOutput request_output) {
+  const bool finished_on_prefill_instance =
       request_output.finished_on_prefill_instance;
   const std::string& service_request_id = request_output.service_request_id;
-  bool status_error =
+  const bool status_error =
       request_output.status.has_value() && !request_output.status.value().ok();
 
   OutputCallback cb;
@@ -652,21 +584,19 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
                    "request id: "
                 << service_request_id;
       requests_.erase(it);
+      instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
       client_disconnected = true;
+    } else if (!status_error) {
+      const bool first_token =
+          update_request_metrics(request, finished_on_prefill_instance);
+      update_token_latency_metrics(request, first_token);
     }
   }
 
   if (client_disconnected) {
-    instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
     remote_requests_output_thread_map_.erase(service_request_id);
     return false;
-  }
-
-  if (!status_error) {
-    // no error, update instance request metrics
-    update_request_metrics(request, finished_on_prefill_instance);
-    update_token_latency_metrics(request, finished_on_prefill_instance);
   }
 
   size_t req_thread_idx = -1;
@@ -701,27 +631,23 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
   return true;
 }
 
-void Scheduler::update_request_metrics(std::shared_ptr<Request> request,
+bool Scheduler::update_request_metrics(const std::shared_ptr<Request>& request,
                                        bool finished_on_prefill_instance) {
-  request->num_generated_tokens += 1;
-  if (finished_on_prefill_instance) {
-    request->prefill_stage_finished = true;
-    // update instance request metrics for prefill finished request
-    instance_mgr_->update_request_metrics(request,
-                                          RequestAction::FINISH_PREFILL);
-  } else {
-    // update instance request metrics
-    instance_mgr_->update_request_metrics(request, RequestAction::GENERATE);
-  }
+  const bool first_token =
+      record_generation(*request, finished_on_prefill_instance);
+  instance_mgr_->update_request_metrics(
+      request,
+      first_token ? RequestAction::FINISH_PREFILL : RequestAction::GENERATE);
+  return first_token;
 }
 
 void Scheduler::update_token_latency_metrics(
-    std::shared_ptr<Request> request,
-    bool finished_on_prefill_instance) {
+    const std::shared_ptr<Request>& request,
+    bool first_token) {
   int64_t tbt_milliseconds =
       absl::ToInt64Milliseconds(absl::Now() - request->latest_generate_time);
   request->latest_generate_time = absl::Now();
-  if (finished_on_prefill_instance) {
+  if (first_token) {
     HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
                       tbt_milliseconds);
   } else {

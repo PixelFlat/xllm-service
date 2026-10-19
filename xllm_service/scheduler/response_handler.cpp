@@ -13,67 +13,53 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "response_handler.h"
+#include "scheduler/response_handler.h"
 
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "common/anthropic_tracer.h"
 #include "http_service/anthropic_adapter.h"
 #include "http_service/anthropic_stream_encoder.h"
 #include "http_service/usage_proto_adapter.h"
-#include "scheduler/xllm_chat_parse_bridge.h"
-#include "xllm/xllm/api_service/stream_output_parser.h"
-#include "xllm/xllm/api_service/utils.h"
-#include "xllm/xllm/function_call/function_call_parser.h"
 
 namespace xllm_service {
-
 namespace {
 
-size_t find_tool_start(const std::string& text) {
-  size_t pos = std::string::npos;
-  const std::vector<std::string> markers = {
-      "<tool_call",
-      "<function=",
-      "<|tool_calls_section_begin|>",
-      "<|tool_call_begin|>",
-      "<｜tool▁calls▁begin｜>",
-      "\"tool_calls\"",
-      "'tool_calls'",
-  };
-
-  for (const auto& marker : markers) {
-    size_t marker_pos = text.find(marker);
-    if (marker_pos != std::string::npos && marker_pos < pos) {
-      pos = marker_pos;
+// Empty parsed frames are valid while an engine parser buffers a partial
+// marker. Never parse raw output as a fallback: that would leak markers or
+// parse twice.
+std::string validate_chat_frames(const llm::RequestOutput& output,
+                                 bool stream,
+                                 bool single_choice) {
+  if (!output.chat_frames.has_value()) {
+    return "Engine output is missing structured chat_output; upgrade xLLM and "
+           "configure tool_call_parser/reasoning_parser on the engine";
+  }
+  if (!stream && output.chat_frames->size() != 1) {
+    return "Non-stream chat output requires one complete response frame";
+  }
+  for (const auto& frame : *output.chat_frames) {
+    if (frame.object() !=
+        (stream ? "chat.completion.chunk" : "chat.completion")) {
+      return "Structured chat output has an unexpected response object";
+    }
+    for (const auto& choice : frame.choices()) {
+      if (!choice.has_index() || (single_choice && choice.index() != 0)) {
+        return "Invalid choice index in structured chat output";
+      }
+      if ((stream && (!choice.has_delta() || choice.has_message())) ||
+          (!stream && (!choice.has_message() || choice.has_delta()))) {
+        return "Structured chat output has an unexpected message type";
+      }
+    }
+    if (single_choice && frame.choices_size() > 1) {
+      return "Anthropic output requires a single choice";
     }
   }
-  return pos;
-}
-
-// GLM-family control markers that may leak into the streamed output when
-// skip_special_tokens is disabled for tool calling (e.g. the model emits
-// <|observation|> right after </tool_call>). They carry no visible content.
-// The non-stream path already drops trailing text after tool calls, so this
-// keeps the streaming behavior consistent and prevents these markers from
-// reaching the client.
-void strip_special_control_tokens(std::string* text) {
-  if (!text || text->empty()) {
-    return;
-  }
-  static const std::vector<std::string> kControlTokens = {
-      "<|observation|>",
-      "<|user|>",
-      "<|assistant|>",
-      "<|system|>",
-      "<|endoftext|>",
-  };
-  for (const auto& token : kControlTokens) {
-    size_t pos = 0;
-    while ((pos = text->find(token, pos)) != std::string::npos) {
-      text->erase(pos, token.length());
-    }
-  }
+  return "";
 }
 
 AnthropicTracer make_anthropic_tracer(
@@ -86,328 +72,40 @@ AnthropicTracer make_anthropic_tracer(
       call_data->request().service_request_id());
 }
 
-void set_logprobs(xllm::proto::ChatChoice* choice,
-                  const std::optional<std::vector<llm::LogProb>>& logprobs) {
-  if (!logprobs.has_value() || logprobs->empty()) {
-    return;
-  }
-
-  auto* proto_logprobs = choice->mutable_logprobs();
-  proto_logprobs->mutable_content()->Reserve(logprobs->size());
-  for (const auto& logprob : *logprobs) {
-    auto* logprob_proto = proto_logprobs->add_content();
-    logprob_proto->set_token(logprob.token);
-    logprob_proto->set_token_id(logprob.token_id);
-    logprob_proto->set_logprob(logprob.logprob);
-    if (logprob.top_logprobs.has_value()) {
-      for (const auto& top_logprob : logprob.top_logprobs.value()) {
-        auto* top_logprob_proto = logprob_proto->add_top_logprobs();
-        top_logprob_proto->set_token(top_logprob.token);
-        top_logprob_proto->set_token_id(top_logprob.token_id);
-        top_logprob_proto->set_logprob(top_logprob.logprob);
-      }
-    }
-  }
-}
-
-bool send_normal_text_chunk(std::shared_ptr<ChatCallData> call_data,
-                            size_t index,
-                            const std::string& content,
-                            const std::string& request_id,
-                            int64_t created_time,
-                            const std::string& model) {
-  std::string filtered_content = content;
-  strip_special_control_tokens(&filtered_content);
-  if (filtered_content.empty()) {
-    return true;
-  }
-
-  auto& response = call_data->response();
-  response.Clear();
-  response.set_object("chat.completion.chunk");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-  auto* choice = response.add_choices();
-  choice->set_index(index);
-  auto* delta = choice->mutable_delta();
-  delta->set_content(filtered_content);
-  return call_data->write(response);
-}
-
-bool send_reasoning_text_chunk(std::shared_ptr<ChatCallData> call_data,
-                               size_t index,
-                               const std::string& content,
-                               const std::string& request_id,
-                               int64_t created_time,
-                               const std::string& model) {
-  if (content.empty()) {
-    return true;
-  }
-
-  auto& response = call_data->response();
-  response.Clear();
-  response.set_object("chat.completion.chunk");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-  auto* choice = response.add_choices();
-  choice->set_index(index);
-  auto* message = choice->mutable_delta();
-  message->set_reasoning_content(content);
-  return call_data->write(response);
-}
-
-bool send_tool_call_chunk(std::shared_ptr<ChatCallData> call_data,
-                          size_t index,
-                          const std::string& tool_call_id,
-                          const std::string& function_name,
-                          const std::string& arguments,
-                          int tool_index,
-                          const std::string& request_id,
-                          int64_t created_time,
-                          const std::string& model) {
-  auto& response = call_data->response();
-  response.Clear();
-  response.set_object("chat.completion.chunk");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  auto* choice = response.add_choices();
-  choice->set_index(index);
-  auto* delta = choice->mutable_delta();
-  auto* tool_call = delta->add_tool_calls();
-  if (!tool_call_id.empty()) {
-    tool_call->set_id(tool_call_id);
-  }
-  tool_call->set_index(tool_index);
-  tool_call->set_type("function");
-
-  auto* function = tool_call->mutable_function();
-  if (!function_name.empty()) {
-    function->set_name(function_name);
-  }
-  if (!arguments.empty()) {
-    function->set_arguments(arguments);
-  }
-
-  return call_data->write(response);
-}
-
-bool process_tool_call_stream(
-    std::shared_ptr<ChatCallData> call_data,
-    std::shared_ptr<xllm::StreamOutputParser> stream_parser,
-    size_t index,
-    const std::string& delta,
-    const std::string& request_id,
-    int64_t created_time,
-    const std::string& model) {
-  auto* parser = stream_parser->get_tool_call_parser(index);
-  if (!parser) {
-    return true;
-  }
-
-  auto parse_result = parser->parse_streaming_increment(delta);
-
-  if (!parse_result.normal_text.empty()) {
-    if (!send_normal_text_chunk(call_data,
-                                index,
-                                parse_result.normal_text,
-                                request_id,
-                                created_time,
-                                model)) {
-      return false;
-    }
-  }
-
-  for (const auto& call_item : parse_result.calls) {
-    stream_parser->set_has_tool_call(index, true);
-
-    std::string tool_call_id;
-    std::string function_name;
-    if (call_item.name.has_value()) {
-      tool_call_id = xllm::function_call::utils::generate_tool_call_id();
-      function_name = call_item.name.value();
-    }
-
-    if (!send_tool_call_chunk(call_data,
-                              index,
-                              tool_call_id,
-                              function_name,
-                              call_item.parameters,
-                              call_item.tool_index,
-                              request_id,
-                              created_time,
-                              model)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 }  // namespace
-
-std::shared_ptr<ChatStreamParseState>
-ResponseHandler::create_chat_stream_parse_state(
-    const std::vector<JsonTool>& tools,
-    const std::string& model,
-    const std::string& tool_call_parser,
-    const std::string& reasoning_parser,
-    bool force_reasoning) {
-  auto state = std::make_shared<ChatStreamParseState>();
-  state->stream_parser = create_stream_output_parser_with_xllm(
-      tools, model, tool_call_parser, reasoning_parser, force_reasoning);
-  return state;
-}
 
 bool ResponseHandler::send_delta_to_client(
     std::shared_ptr<ChatCallData> call_data,
-    bool include_usage,
-    int64_t created_time,
-    const std::string& model,
-    const llm::RequestOutput& output,
-    std::shared_ptr<ChatStreamParseState> stream_state) {
-  auto& response = call_data->response();
-  auto& request_id = output.request_id;
-  auto stream_parser = stream_state ? stream_state->stream_parser : nullptr;
-  auto* first_message_sent =
-      stream_state ? &stream_state->first_message_sent : nullptr;
-  if (stream_parser && !output.outputs.empty()) {
-    stream_parser->check_resize_for_index(output.outputs.size() - 1);
+    const llm::RequestOutput& output) {
+  const std::string error = validate_chat_frames(output,
+                                                 /*stream=*/true,
+                                                 /*single_choice=*/false);
+  if (!error.empty()) {
+    call_data->finish_with_error(error);
+    return false;
   }
-
-  for (const auto& seq_output : output.outputs) {
-    const auto& index = seq_output.index;
-    std::string cur_text = seq_output.text;
-
-    if (first_message_sent &&
-        first_message_sent->find(index) == first_message_sent->end()) {
-      response.Clear();
-      response.set_object("chat.completion.chunk");
-      response.set_id(request_id);
-      response.set_created(created_time);
-      response.set_model(model);
-      auto* choice = response.add_choices();
-      choice->set_index(index);
-      auto* message = choice->mutable_delta();
-      message->set_role("assistant");
-      message->set_content("");
-      if (!call_data->write(response)) {
-        return false;
-      }
-      first_message_sent->insert(index);
-    }
-
-    if (!cur_text.empty() && stream_parser && stream_parser->is_reasoning()) {
-      auto parser = stream_parser->get_reasoning_parser(index);
-      auto result = parser->parse_stream_chunk(cur_text);
-      if (result.normal_text.has_value()) {
-        cur_text = result.normal_text.value();
-      } else {
-        cur_text = "";
-      }
-      if (result.reasoning_text.has_value()) {
-        if (!send_reasoning_text_chunk(call_data,
-                                       index,
-                                       result.reasoning_text.value(),
-                                       request_id,
-                                       created_time,
-                                       model)) {
-          return false;
-        }
-      }
-    }
-
-    if (!cur_text.empty()) {
-      if (stream_parser && stream_parser->is_tool_call()) {
-        if (!process_tool_call_stream(call_data,
-                                      stream_parser,
-                                      index,
-                                      cur_text,
-                                      request_id,
-                                      created_time,
-                                      model)) {
-          return false;
-        }
-      } else {
-        strip_special_control_tokens(&cur_text);
-        if (!cur_text.empty()) {
-          response.Clear();
-          response.set_object("chat.completion.chunk");
-          response.set_id(request_id);
-          response.set_created(created_time);
-          response.set_model(model);
-          auto* choice = response.add_choices();
-          choice->set_index(index);
-          set_logprobs(choice, seq_output.logprobs);
-          auto* message = choice->mutable_delta();
-          message->set_content(cur_text);
-          if (!call_data->write(response)) {
-            return false;
-          }
-        }
-      }
-    }
-
-    if (seq_output.finish_reason.has_value()) {
-      if (stream_parser && stream_parser->get_has_tool_call(index)) {
-        auto send_func = [&](const std::string& arguments, int tool_index) {
-          return send_tool_call_chunk(call_data,
-                                      index,
-                                      "",
-                                      "",
-                                      arguments,
-                                      tool_index,
-                                      request_id,
-                                      created_time,
-                                      model);
-        };
-        if (!xllm::api_service::check_for_unstreamed_tool_args(
-                stream_parser, index, send_func)) {
-          return false;
-        }
-      }
-
-      response.Clear();
-      response.set_object("chat.completion.chunk");
-      response.set_id(request_id);
-      response.set_created(created_time);
-      response.set_model(model);
-      auto* choice = response.add_choices();
-      choice->set_index(index);
-      choice->mutable_delta();
-      if (stream_parser && stream_parser->get_has_tool_call(index) &&
-          seq_output.finish_reason.value() == "stop") {
-        choice->set_finish_reason("tool_calls");
-      } else {
-        choice->set_finish_reason(seq_output.finish_reason.value());
-      }
-      if (!call_data->write(response)) {
-        return false;
-      }
-    }
-  }
-
-  if (include_usage && output.usage.has_value()) {
-    response.Clear();
-    const auto& usage = output.usage.value();
-    response.set_object("chat.completion.chunk");
-    response.set_id(request_id);
-    response.set_created(created_time);
-    response.set_model(model);
-    *response.mutable_usage() = to_openai_usage_proto(usage);
-    if (!call_data->write(response)) {
+  for (const auto& frame : *output.chat_frames) {
+    if (!call_data->write(frame)) {
       return false;
     }
   }
+  return output.finished ? call_data->finish() : true;
+}
 
-  if (output.finished) {
-    response.Clear();
-    return call_data->finish();
+bool ResponseHandler::send_result_to_client(
+    std::shared_ptr<ChatCallData> call_data,
+    const llm::RequestOutput& output) {
+  if (!output.finished) {
+    return true;
   }
-  return true;
+  const std::string error = validate_chat_frames(output,
+                                                 /*stream=*/false,
+                                                 /*single_choice=*/false);
+  if (!error.empty()) {
+    call_data->finish_with_error(error);
+    return false;
+  }
+  return call_data->write_and_finish(output.chat_frames->front());
 }
 
 bool ResponseHandler::send_delta_to_client(
@@ -487,278 +185,6 @@ bool ResponseHandler::send_delta_to_client(
   return true;
 }
 
-bool ResponseHandler::send_delta_to_client(
-    std::shared_ptr<AnthropicCallData> call_data,
-    const std::string& model,
-    const llm::RequestOutput& output,
-    AnthropicStreamEncoder& encoder,
-    std::shared_ptr<xllm::StreamOutputParser> stream_parser) {
-  std::vector<std::string> sse_events;
-  auto tracer = make_anthropic_tracer(call_data);
-
-  if (stream_parser && !output.outputs.empty()) {
-    stream_parser->check_resize_for_index(output.outputs.size() - 1);
-  }
-
-  for (const auto& seq_output : output.outputs) {
-    const auto& index = seq_output.index;
-    std::string cur_text = seq_output.text;
-    tracer.trace("stream_model_delta",
-                 "index=" + std::to_string(index) +
-                     " finished=" + (output.finished ? "true" : "false") +
-                     " finish_reason=" + seq_output.finish_reason.value_or("") +
-                     " text=" + cur_text);
-
-    // Splits a chunk into reasoning (emitted now) and the remaining plain text
-    // (accumulated into *normal_text). Reasoning/text encoding is delegated to
-    // the encoder; only the split decision lives here.
-    auto emit_reasoning = [&](std::string text,
-                              std::string* normal_text) -> bool {
-      if (text.empty() || !stream_parser || !stream_parser->is_reasoning()) {
-        if (normal_text) {
-          *normal_text += text;
-        }
-        return true;
-      }
-
-      auto* parser = stream_parser->get_reasoning_parser(index);
-      auto result = parser->parse_stream_chunk(text);
-      if (result.reasoning_text.has_value()) {
-        auto adapt_result = encoder.on_reasoning(
-            output, result.reasoning_text.value(), &sse_events);
-        if (!adapt_result.ok) {
-          return call_data->finish_with_error(adapt_result.error);
-        }
-      }
-      if (normal_text && result.normal_text.has_value()) {
-        *normal_text += result.normal_text.value();
-      }
-      return true;
-    };
-
-    auto emit_text = [&](const std::string& text) -> bool {
-      std::string filtered = text;
-      strip_special_control_tokens(&filtered);
-      if (filtered.empty()) {
-        return true;
-      }
-      auto result = encoder.on_text(output, filtered, &sse_events);
-      if (!result.ok) {
-        return call_data->finish_with_error(result.error);
-      }
-      return true;
-    };
-
-    if (!cur_text.empty() && stream_parser && stream_parser->is_tool_call()) {
-      auto* parser = stream_parser->get_tool_call_parser(index);
-      if (parser) {
-        std::string tool_text = cur_text;
-        const bool parsing_tool =
-            encoder.pending_tool_call() ||
-            encoder.last_content_block_type() == "tool_use";
-        bool saw_tool_start = find_tool_start(tool_text) != std::string::npos;
-        if (!parsing_tool) {
-          size_t tool_pos = find_tool_start(tool_text);
-          if (tool_pos != std::string::npos) {
-            std::string normal_text;
-            if (!emit_reasoning(tool_text.substr(0, tool_pos), &normal_text)) {
-              return false;
-            }
-            if (!normal_text.empty() && !emit_text(normal_text)) {
-              return false;
-            }
-            tool_text = tool_text.substr(tool_pos);
-            saw_tool_start = true;
-          }
-        }
-        if (!parsing_tool && find_tool_start(tool_text) == std::string::npos) {
-          std::string normal_text;
-          if (!emit_reasoning(tool_text, &normal_text)) {
-            return false;
-          }
-          if (!normal_text.empty() && !emit_text(normal_text)) {
-            return false;
-          }
-          tool_text.clear();
-        }
-        if (saw_tool_start) {
-          encoder.set_pending_tool_call(true);
-        }
-
-        auto parse_result = parser->parse_streaming_increment(tool_text);
-        if (!parse_result.normal_text.empty()) {
-          std::string normal_text;
-          if (!emit_reasoning(parse_result.normal_text, &normal_text)) {
-            return false;
-          }
-          if (!normal_text.empty() && !emit_text(normal_text)) {
-            return false;
-          }
-        }
-
-        for (const auto& call_item : parse_result.calls) {
-          stream_parser->set_has_tool_call(index, true);
-
-          std::string tool_call_id;
-          std::string function_name;
-          if (call_item.name.has_value()) {
-            tool_call_id = xllm::function_call::utils::generate_tool_call_id();
-            function_name = call_item.name.value();
-            encoder.set_pending_tool_call(false);
-          }
-
-          auto result = encoder.on_tool(output,
-                                        tool_call_id,
-                                        function_name,
-                                        call_item.parameters,
-                                        &sse_events);
-          if (!result.ok) {
-            return call_data->finish_with_error(result.error);
-          }
-          if (encoder.last_content_block_type() == "tool_use") {
-            encoder.set_pending_tool_call(false);
-          }
-        }
-      }
-    } else if (!cur_text.empty() && stream_parser &&
-               stream_parser->is_reasoning()) {
-      std::string normal_text;
-      if (!emit_reasoning(cur_text, &normal_text)) {
-        return false;
-      }
-      // The plain-text remainder after the reasoning boundary must still be
-      // emitted as a text block (the tool branch above does the same).
-      if (!normal_text.empty() && !emit_text(normal_text)) {
-        return false;
-      }
-    } else if (!cur_text.empty()) {
-      if (!emit_text(cur_text)) {
-        return false;
-      }
-    }
-
-    if (seq_output.finish_reason.has_value() && stream_parser &&
-        stream_parser->get_has_tool_call(index)) {
-      auto send_func = [&](const std::string& arguments, int tool_index) {
-        (void)tool_index;
-        auto result = encoder.on_tool(output, "", "", arguments, &sse_events);
-        return result.ok;
-      };
-      if (!xllm::api_service::check_for_unstreamed_tool_args(
-              stream_parser, index, send_func)) {
-        return false;
-      }
-    }
-  }
-
-  if (output.finished) {
-    auto result = encoder.finish(output, &sse_events);
-    if (!result.ok) {
-      return call_data->finish_with_error(result.error);
-    }
-  }
-
-  for (const auto& sse : sse_events) {
-    tracer.trace("stream_sse", sse);
-    if (!call_data->write(sse)) {
-      return false;
-    }
-  }
-
-  if (output.finished) {
-    return call_data->finish();
-  }
-  return true;
-}
-
-bool ResponseHandler::send_result_to_client(
-    std::shared_ptr<ChatCallData> call_data,
-    int64_t created_time,
-    const std::string& model,
-    const llm::RequestOutput& req_output,
-    const std::vector<JsonTool>& tools,
-    const std::string& tool_call_parser,
-    const std::string& reasoning_parser,
-    bool force_reasoning) {
-  auto& response = call_data->response();
-  auto& request_id = req_output.request_id;
-  response.set_object("chat.completion");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  response.mutable_choices()->Reserve(req_output.outputs.size());
-  for (const auto& output : req_output.outputs) {
-    // add choices into response
-    auto* choice = response.add_choices();
-    choice->set_index(output.index);
-
-    // set_logprobs
-    if (output.logprobs.has_value() && !output.logprobs.value().empty()) {
-      auto* proto_logprobs = choice->mutable_logprobs();
-      proto_logprobs->mutable_content()->Reserve(
-          output.logprobs.value().size());
-      for (const auto& logprob : output.logprobs.value()) {
-        auto* logprob_proto = proto_logprobs->add_content();
-        logprob_proto->set_token(logprob.token);
-        logprob_proto->set_token_id(logprob.token_id);
-        logprob_proto->set_logprob(logprob.logprob);
-
-        if (logprob.top_logprobs.has_value()) {
-          for (const auto& top_logprob : logprob.top_logprobs.value()) {
-            auto* top_logprob_proto = logprob_proto->add_top_logprobs();
-            top_logprob_proto->set_token(top_logprob.token);
-            top_logprob_proto->set_token_id(top_logprob.token_id);
-            top_logprob_proto->set_logprob(top_logprob.logprob);
-          }
-        }
-      }
-    }
-
-    auto* message = choice->mutable_message();
-    message->set_role("assistant");
-
-    if (!output.text.empty()) {
-      auto result =
-          parse_chat_output_with_xllm(output.text,
-                                      tools,
-                                      model,
-                                      output.finish_reason.value_or(""),
-                                      tool_call_parser,
-                                      reasoning_parser,
-                                      force_reasoning,
-                                      response.GetArena());
-      strip_special_control_tokens(&result.text);
-      message->set_content(result.text);
-      if (result.reasoning_content.has_value()) {
-        message->set_reasoning_content(result.reasoning_content.value());
-      }
-      if (result.tool_calls.has_value()) {
-        auto& source_tool_calls = *result.tool_calls;
-        message->mutable_tool_calls()->Swap(&source_tool_calls);
-      }
-      if (!result.finish_reason.empty()) {
-        choice->set_finish_reason(result.finish_reason);
-      } else if (output.finish_reason.has_value()) {
-        choice->set_finish_reason(output.finish_reason.value());
-      }
-    } else {
-      message->set_content(output.text);
-      if (output.finish_reason.has_value()) {
-        choice->set_finish_reason(output.finish_reason.value());
-      }
-    }
-  }
-
-  // add usage statistics
-  if (req_output.usage.has_value()) {
-    const auto& usage = req_output.usage.value();
-    *response.mutable_usage() = to_openai_usage_proto(usage);
-  }
-
-  return call_data->write_and_finish(response);
-}
-
 bool ResponseHandler::send_result_to_client(
     std::shared_ptr<CompletionCallData> call_data,
     int64_t created_time,
@@ -802,71 +228,112 @@ bool ResponseHandler::send_result_to_client(
   return call_data->write_and_finish(response);
 }
 
+bool ResponseHandler::send_delta_to_client(
+    std::shared_ptr<AnthropicCallData> call_data,
+    const llm::RequestOutput& output,
+    AnthropicStreamEncoder& encoder) {
+  const std::string error = validate_chat_frames(output,
+                                                 /*stream=*/true,
+                                                 /*single_choice=*/true);
+  if (!error.empty()) {
+    call_data->finish_with_error(error);
+    return false;
+  }
+  std::vector<std::string> sse_events;
+  for (const auto& frame : *output.chat_frames) {
+    for (const auto& choice : frame.choices()) {
+      const auto& delta = choice.delta();
+      auto result =
+          encoder.on_reasoning(output, delta.reasoning_content(), &sse_events);
+      if (result.ok) {
+        result = encoder.on_text(output, delta.content(), &sse_events);
+      }
+      if (!result.ok) {
+        call_data->finish_with_error(result.error);
+        return false;
+      }
+      for (const auto& tool : delta.tool_calls()) {
+        result = encoder.on_tool(output,
+                                 tool.id(),
+                                 tool.function().name(),
+                                 tool.function().arguments(),
+                                 &sse_events);
+        if (!result.ok) {
+          call_data->finish_with_error(result.error);
+          return false;
+        }
+      }
+    }
+  }
+  if (output.finished) {
+    auto result = encoder.finish(output, &sse_events);
+    if (!result.ok) {
+      call_data->finish_with_error(result.error);
+      return false;
+    }
+  }
+  auto tracer = make_anthropic_tracer(call_data);
+  for (const auto& sse : sse_events) {
+    tracer.trace("stream_sse", sse);
+    if (!call_data->write(sse)) {
+      return false;
+    }
+  }
+  return output.finished ? call_data->finish() : true;
+}
+
 bool ResponseHandler::send_result_to_client(
     std::shared_ptr<AnthropicCallData> call_data,
     const std::string& model,
-    const llm::RequestOutput& req_output,
-    const std::vector<JsonTool>& tools,
-    const std::string& tool_call_parser,
-    const std::string& reasoning_parser,
-    bool force_reasoning) {
+    const llm::RequestOutput& output) {
+  if (!output.finished) {
+    return true;
+  }
+  const std::string error = validate_chat_frames(output,
+                                                 /*stream=*/false,
+                                                 /*single_choice=*/true);
+  if (!error.empty()) {
+    call_data->finish_with_error(error);
+    return false;
+  }
+  const auto& frame = output.chat_frames->front();
+  if (frame.choices_size() != 1) {
+    call_data->finish_with_error("Anthropic output requires one final choice");
+    return false;
+  }
+  const auto& choice = frame.choices(0);
+  const auto& message = choice.message();
+  // Adapt structured fields to Anthropic blocks; no model text is parsed here.
+  llm::RequestOutput adapted;
+  adapted.request_id = output.request_id;
+  adapted.usage = output.usage;
+  adapted.finished = output.finished;
+  llm::SequenceOutput sequence;
+  sequence.index = 0;
+  sequence.text = message.content();
+  if (choice.has_finish_reason()) {
+    sequence.finish_reason = choice.finish_reason();
+  }
+  adapted.outputs.emplace_back(std::move(sequence));
   auto& response = call_data->response();
-  auto tracer = make_anthropic_tracer(call_data);
-  llm::RequestOutput output = req_output;
-  const google::protobuf::RepeatedPtrField<::xllm::proto::ToolCall>*
-      tool_calls = nullptr;
-  std::optional<google::protobuf::RepeatedPtrField<::xllm::proto::ToolCall>>
-      parsed_tool_calls;
-  std::optional<std::string> reasoning_content;
-
-  if (!output.outputs.empty() && !output.outputs.front().text.empty()) {
-    tracer.trace(
-        "non_stream_model_output",
-        "finish_reason=" + output.outputs.front().finish_reason.value_or("") +
-            " text=" + output.outputs.front().text);
-    auto parsed = parse_chat_output_with_xllm(
-        output.outputs.front().text,
-        tools,
-        model,
-        output.outputs.front().finish_reason.value_or(""),
-        tool_call_parser,
-        reasoning_parser,
-        force_reasoning,
-        response.GetArena());
-    output.outputs.front().text = std::move(parsed.text);
-    if (!parsed.finish_reason.empty()) {
-      output.outputs.front().finish_reason = std::move(parsed.finish_reason);
-    }
-    if (parsed.reasoning_content.has_value()) {
-      reasoning_content = std::move(parsed.reasoning_content.value());
-    }
-    if (parsed.tool_calls.has_value()) {
-      parsed_tool_calls = std::move(parsed.tool_calls.value());
-      tool_calls = &parsed_tool_calls.value();
-    }
-    tracer.trace(
-        "non_stream_parsed_output",
-        "text=" + output.outputs.front().text + " has_reasoning=" +
-            (reasoning_content.has_value() ? "true" : "false") +
-            " has_tool_calls=" + (tool_calls == nullptr ? "false" : "true"));
-    if (reasoning_content.has_value()) {
-      tracer.trace("non_stream_reasoning", reasoning_content.value());
-    }
-  }
-
-  auto result = fill_anthropic_resp(model, output, &response, tool_calls);
+  auto result =
+      fill_anthropic_resp(model, adapted, &response, &message.tool_calls());
   if (!result.ok) {
-    return call_data->finish_with_error(result.error);
+    call_data->finish_with_error(result.error);
+    return false;
   }
-
-  std::string json_output;
-  std::string err_msg;
-  if (!anthropic_json(response, reasoning_content, &json_output, &err_msg)) {
-    LOG(ERROR) << "Anthropic response json failed: " << err_msg;
-    return call_data->finish_with_error(err_msg);
+  std::optional<std::string> reasoning;
+  if (message.has_reasoning_content()) {
+    reasoning = message.reasoning_content();
   }
-  tracer.trace("non_stream_json_response", json_output);
-  return call_data->write_and_finish(json_output);
+  std::string json;
+  std::string json_error;
+  if (!anthropic_json(response, reasoning, &json, &json_error)) {
+    call_data->finish_with_error(json_error);
+    return false;
+  }
+  make_anthropic_tracer(call_data).trace("non_stream_json_response", json);
+  return call_data->write_and_finish(json);
 }
 
 }  // namespace xllm_service

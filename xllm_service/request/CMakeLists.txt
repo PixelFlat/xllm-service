@@ -7,4 +7,6 @@ cc_library(
     request.h
   DEPS
     :common
+    :chat_template
+    brpc-static
 )

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "http_service/anthropic_adapter.h"
 
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
 #include <google/protobuf/util/json_util.h>
 #include <json2pb/pb_to_json.h>
 
@@ -348,6 +350,31 @@ AnthropicAdaptResult add_content_msg(
   }
 }
 
+bool is_legacy_thinking_enabled(
+    const xllm::proto::AnthropicMessagesRequest& request) {
+  // Newer engine schemas reserve this legacy field. Keep the old schema's
+  // mapping without requiring its generated accessor in paired builds.
+  const auto* thinking_field =
+      request.GetDescriptor()->FindFieldByName("thinking");
+  const auto* reflection = request.GetReflection();
+  if (thinking_field == nullptr ||
+      thinking_field->cpp_type() !=
+          google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE ||
+      !reflection->HasField(request, thinking_field)) {
+    return false;
+  }
+  const auto& thinking = reflection->GetMessage(request, thinking_field);
+  const auto* type_field = thinking.GetDescriptor()->FindFieldByName("type");
+  if (type_field == nullptr ||
+      type_field->cpp_type() !=
+          google::protobuf::FieldDescriptor::CPPTYPE_STRING) {
+    return false;
+  }
+  const std::string type =
+      thinking.GetReflection()->GetString(thinking, type_field);
+  return type == "adaptive" || type == "enabled";
+}
+
 void fill_generation_params(
     const xllm::proto::AnthropicMessagesRequest& anthropic_request,
     xllm::proto::ChatRequest* chat_request) {
@@ -378,9 +405,7 @@ void fill_generation_params(
           ->mutable_fields())["reasoning_effort"]
         .set_string_value(anthropic_request.output_config().effort());
   }
-  if (anthropic_request.has_thinking() &&
-      (anthropic_request.thinking().type() == "adaptive" ||
-       anthropic_request.thinking().type() == "enabled")) {
+  if (is_legacy_thinking_enabled(anthropic_request)) {
     (*chat_request->mutable_chat_template_kwargs()
           ->mutable_fields())["thinking"]
         .set_bool_value(true);

@@ -2,10 +2,20 @@ include(cc_test)
 
 cc_test(
   NAME
-    xllm_chat_parse_bridge_test
+    request_metrics_test
   SRCS
-    xllm_chat_parse_bridge_test.cpp
+    request_metrics_test.cpp
   DEPS
-    :xllm_chat_parse_runtime
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    response_handler_test
+  SRCS
+    response_handler_test.cpp
+  DEPS
+    :response_handler
     GTest::gtest_main
 )

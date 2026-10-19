@@ -234,8 +234,6 @@ int main(int argc, char* argv[]) {
       .enable_request_trace(FLAGS_enable_request_trace)
       .block_size(FLAGS_block_size)
       .tokenizer_path(FLAGS_tokenizer_path)
-      .tool_call_parser(FLAGS_tool_call_parser)
-      .reasoning_parser(FLAGS_reasoning_parser)
       .default_backend_type(FLAGS_default_backend_type)
       .vllm_http_timeout_ms(FLAGS_vllm_http_timeout_ms)
       .internal_api_token(FLAGS_internal_api_token);

@@ -15,6 +15,8 @@ limitations under the License.
 
 syntax = "proto3";
 
+import "chat.proto";
+
 package xllm_service.proto;
 option cc_generic_services = true;
 
@@ -138,7 +140,12 @@ message GenerationStatus {
   string status_msg = 2;
 }
 
-// Stream response token to prefill instance from decode.
+// Presence with an empty list means the engine parser is buffering.
+message StructuredChatOutput {
+  repeated xllm.proto.ChatResponse frames = 1;
+}
+
+// Batched engine outputs sent directly to the owning service.
 message DisaggStreamGeneration {
   // req id
   string req_id = 1;
@@ -151,6 +158,7 @@ message DisaggStreamGeneration {
   OutputUsage usage = 5;
   bool finished = 6;
   bool finished_on_prefill_instance = 7;
+  StructuredChatOutput chat_output = 8;
 }
 
 message DisaggStreamGenerations {

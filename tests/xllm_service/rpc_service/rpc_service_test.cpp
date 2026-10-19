@@ -181,5 +181,45 @@ TEST(DisaggGenerationAdapterTest, ConvertsCompleteValidGeneration) {
   EXPECT_FALSE(converted_logprob.top_logprobs->front().finished_token);
 }
 
+TEST(DisaggGenerationAdapterTest, DistinguishesBufferedFramesFromLegacyOutput) {
+  auto generation = make_generation(8, 2, 10, 4);
+  auto legacy = request_output_from_disagg_generation(generation);
+  ASSERT_TRUE(legacy.output.has_value());
+  EXPECT_FALSE(legacy.output->chat_frames.has_value());
+  generation.mutable_chat_output();
+  auto buffered = request_output_from_disagg_generation(generation);
+  ASSERT_TRUE(buffered.output.has_value());
+  ASSERT_TRUE(buffered.output->chat_frames.has_value());
+  EXPECT_TRUE(buffered.output->chat_frames->empty());
+}
+
+TEST(DisaggGenerationAdapterTest,
+     PreservesStructuredReasoningToolsAndLogprobs) {
+  auto generation = make_generation(8, 2, 10, 4);
+  auto* frame = generation.mutable_chat_output()->add_frames();
+  frame->set_object("chat.completion.chunk");
+  auto* choice = frame->add_choices();
+  choice->set_index(2);
+  choice->set_finish_reason("tool_calls");
+  choice->mutable_delta()->set_reasoning_content("reason");
+  auto* tool = choice->mutable_delta()->add_tool_calls();
+  tool->set_id("call_engine");
+  tool->set_index(3);
+  tool->mutable_function()->set_name("weather");
+  tool->mutable_function()->set_arguments(R"({"city":"Paris"})");
+  choice->mutable_logprobs()->add_content()->set_logprob(-0.25F);
+  auto result = request_output_from_disagg_generation(generation);
+  ASSERT_TRUE(result.output.has_value());
+  ASSERT_TRUE(result.output->chat_frames.has_value());
+  ASSERT_EQ(result.output->chat_frames->size(), 1U);
+  const auto& parsed = result.output->chat_frames->front().choices(0);
+  EXPECT_EQ(parsed.index(), 2);
+  EXPECT_EQ(parsed.delta().reasoning_content(), "reason");
+  EXPECT_EQ(parsed.delta().tool_calls(0).id(), "call_engine");
+  EXPECT_EQ(parsed.delta().tool_calls(0).index(), 3);
+  EXPECT_EQ(parsed.finish_reason(), "tool_calls");
+  EXPECT_FLOAT_EQ(parsed.logprobs().content(0).logprob(), -0.25F);
+}
+
 }  // namespace
 }  // namespace xllm_service
