@@ -41,6 +41,9 @@ bool FastTokenizer::encode(const std::string_view& text,
 
   std::vector<int32_t> ret(result.token_ids, result.token_ids + result.len);
   *ids = std::move(ret);
+  if (result.token_ids != nullptr && result.len > 0) {
+    tokenizers_free_encode_results(&result, 1);
+  }
 
   return true;
 }

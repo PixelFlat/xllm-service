@@ -48,8 +48,11 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   // own tokenization / chat templating. Skip building the local tokenizer and
   // chat template so the master does not require a tokenizer.model / template.
   if (options_.default_backend_type() != "vllm") {
-    tokenizer_ = TokenizerFactory::create_tokenizer(options_.tokenizer_path(),
-                                                    &tokenizer_args_);
+    CHECK_GT(options_.num_threads(), 0);
+    tokenizer_pool_ = std::make_unique<TokenizerPool>(
+        TokenizerFactory::create_tokenizer(options_.tokenizer_path(),
+                                           &tokenizer_args_),
+        static_cast<size_t>(options_.num_threads()));
 
     // Select the chat template by config.json model_type (jinja by default).
     model_type = load_model_type(options_.tokenizer_path());
@@ -171,10 +174,9 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
       LOG(ERROR) << "Chat template has not configured.";
       return false;
     }
-    if (!get_tls_tokenizer()->encode(
-            request->prompt,
-            &request->token_ids,
-            chat_template_->encode_add_special_tokens())) {
+    if (!tokenizer_pool_->encode(request->prompt,
+                                 &request->token_ids,
+                                 chat_template_->encode_add_special_tokens())) {
       LOG(ERROR) << "Encode prompt failed: " << request->prompt;
       return false;
     }
@@ -332,11 +334,6 @@ std::vector<std::string> Scheduler::get_static_decode_list(
 std::vector<std::string> Scheduler::get_static_prefill_list(
     const std::string& instance_name) {
   return instance_mgr_->get_static_prefill_list(instance_name);
-}
-
-Tokenizer* Scheduler::get_tls_tokenizer() {
-  thread_local std::unique_ptr<Tokenizer> tls_tokenizer(tokenizer_->clone());
-  return tls_tokenizer.get();
 }
 
 bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
