@@ -28,6 +28,7 @@ limitations under the License.
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
 #include "scheduler/request_metrics.h"
+#include "scheduler/request_output.h"
 #include "tokenizer/tokenizer_factory.h"
 
 namespace {
@@ -518,8 +519,7 @@ void Scheduler::clear_requests_on_failed_instance(
   std::vector<std::shared_ptr<Request>> cleared_requests;
   {
     std::lock_guard<std::mutex> lock(request_mutex_);
-    for (auto it = requests_.begin(); it != requests_.end();) {
-      const auto& request = it->second;
+    for (const auto& [service_request_id, request] : requests_) {
       const bool clear_prefill =
           ((type == InstanceType::DEFAULT || type == InstanceType::PREFILL) &&
            request->routing.prefill_name == instance_name &&
@@ -530,18 +530,9 @@ void Scheduler::clear_requests_on_failed_instance(
            request->routing.decode_name == instance_name &&
            request->decode_incarnation_id == incarnation_id);
       if (!clear_prefill && !clear_decode) {
-        ++it;
         continue;
       }
-      instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
       cleared_requests.emplace_back(request);
-      it = requests_.erase(it);
-    }
-  }
-  if (!cleared_requests.empty()) {
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    for (const auto& request : cleared_requests) {
-      remote_requests_output_thread_map_.erase(request->service_request_id);
     }
   }
   for (const auto& request : cleared_requests) {
@@ -549,7 +540,7 @@ void Scheduler::clear_requests_on_failed_instance(
     output.service_request_id = request->service_request_id;
     output.status = llm::Status(llm::StatusCode::CANCELLED,
                                 "Instance is failed and deleted");
-    request->output_callback(output);
+    handle_generation(std::move(output));
     LOG(INFO) << "Clear request on failed instance: " << instance_name
               << ", incarnation_id: " << incarnation_id
               << ", service_request_id: " << request->service_request_id;
@@ -559,11 +550,10 @@ void Scheduler::clear_requests_on_failed_instance(
 bool Scheduler::handle_generation(llm::RequestOutput request_output) {
   const bool finished_on_prefill_instance =
       request_output.finished_on_prefill_instance;
-  const std::string& service_request_id = request_output.service_request_id;
+  std::string service_request_id = request_output.service_request_id;
   const bool status_error =
       request_output.status.has_value() && !request_output.status.value().ok();
 
-  OutputCallback cb;
   std::shared_ptr<Request> request;
   bool client_disconnected = false;
   {
@@ -576,7 +566,6 @@ bool Scheduler::handle_generation(llm::RequestOutput request_output) {
       return false;
     }
     request = it->second;
-    cb = request->output_callback;
 
     // check client connection
     if (request->call_data->is_disconnected()) {
@@ -614,17 +603,13 @@ bool Scheduler::handle_generation(llm::RequestOutput request_output) {
 
   output_threadpools_[req_thread_idx].schedule(
       [this,
-       service_request_id,
-       cb,
-       status_error,
+       service_request_id = std::move(service_request_id),
+       request = std::move(request),
        request_output = std::move(request_output)]() mutable {
-        if (!cb(request_output) || status_error) {
-          finish_request(service_request_id, true);
-          return;
-        }
-        if (request_output.finished) {
-          finish_request(service_request_id);
-          return;
+        const std::optional<bool> finished =
+            deliver_request_output(*request, request_output);
+        if (finished.has_value()) {
+          finish_request(service_request_id, *finished);
         }
       });
 

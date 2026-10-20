@@ -35,6 +35,18 @@ xllm::proto::AnthropicMessagesRequest parse_request(const std::string& json) {
   return request;
 }
 
+bool rejects_unrepresentable_thinking(const std::string& json) {
+  if (xllm::proto::AnthropicMessagesRequest::descriptor()->FindFieldByName(
+          "thinking") != nullptr) {
+    return false;
+  }
+  xllm::proto::AnthropicMessagesRequest request;
+  const auto result = parse_anthropic_json(json, &request);
+  EXPECT_FALSE(result.ok);
+  EXPECT_NE(result.error.find("thinking is not supported"), std::string::npos);
+  return true;
+}
+
 const std::string& text_content(const Message& message) {
   return std::get<std::string>(message.content);
 }
@@ -134,11 +146,7 @@ TEST(AnthropicAdapterTest, DefaultsMissingTemperatureToOne) {
 }
 
 TEST(AnthropicAdapterTest, MapsAdaptiveThinkingAndEffortToTemplateKwargs) {
-  if (xllm::proto::AnthropicMessagesRequest::descriptor()->FindFieldByName(
-          "thinking") == nullptr) {
-    GTEST_SKIP() << "The paired schema reserves the legacy thinking field.";
-  }
-  auto request = parse_request(R"({
+  const std::string json = R"({
     "model": "test-model",
     "max_tokens": 8,
     "thinking": {"type": "adaptive", "budget_tokens": 1024},
@@ -146,7 +154,11 @@ TEST(AnthropicAdapterTest, MapsAdaptiveThinkingAndEffortToTemplateKwargs) {
     "messages": [
       {"role": "user", "content": "hello"}
     ]
-  })");
+  })";
+  if (rejects_unrepresentable_thinking(json)) {
+    return;
+  }
+  auto request = parse_request(json);
 
   ASSERT_TRUE(request.has_output_config());
   ASSERT_TRUE(request.output_config().has_effort());
@@ -166,18 +178,18 @@ TEST(AnthropicAdapterTest, MapsAdaptiveThinkingAndEffortToTemplateKwargs) {
 }
 
 TEST(AnthropicAdapterTest, MapsEnabledThinkingToTemplateKwargs) {
-  if (xllm::proto::AnthropicMessagesRequest::descriptor()->FindFieldByName(
-          "thinking") == nullptr) {
-    GTEST_SKIP() << "The paired schema reserves the legacy thinking field.";
-  }
-  auto request = parse_request(R"({
+  const std::string json = R"({
     "model": "test-model",
     "max_tokens": 8,
     "thinking": {"type": "enabled"},
     "messages": [
       {"role": "user", "content": "hello"}
     ]
-  })");
+  })";
+  if (rejects_unrepresentable_thinking(json)) {
+    return;
+  }
+  auto request = parse_request(json);
 
   xllm::proto::ChatRequest chat_request;
   ChatMessages messages;
@@ -213,19 +225,37 @@ TEST(AnthropicAdapterTest, PreservesMaxEffortWithoutEnablingThinking) {
   EXPECT_FALSE(kwargs.contains("thinking"));
 }
 
-TEST(AnthropicAdapterTest, OmitsKwargsForUnsupportedThinkingWithoutEffort) {
-  if (xllm::proto::AnthropicMessagesRequest::descriptor()->FindFieldByName(
-          "thinking") == nullptr) {
-    GTEST_SKIP() << "The paired schema reserves the legacy thinking field.";
+TEST(AnthropicAdapterTest, PreservesExplicitThinkingTemplateKwargs) {
+  for (const bool enabled : {false, true}) {
+    const nlohmann::json json = {
+        {"model", "test-model"},
+        {"max_tokens", 8},
+        {"chat_template_kwargs", {{"enable_thinking", enabled}}},
+        {"messages", {{{"role", "user"}, {"content", "hello"}}}}};
+    const auto request = parse_request(json.dump());
+    xllm::proto::ChatRequest chat_request;
+    ChatMessages messages;
+    const auto result = adapt_request(request, &chat_request, &messages);
+    ASSERT_TRUE(result.ok) << result.error;
+    const auto& kwargs = chat_request.chat_template_kwargs().fields();
+    ASSERT_TRUE(kwargs.contains("enable_thinking"));
+    EXPECT_EQ(kwargs.at("enable_thinking").bool_value(), enabled);
   }
-  auto request = parse_request(R"({
+}
+
+TEST(AnthropicAdapterTest, OmitsKwargsForUnsupportedThinkingWithoutEffort) {
+  const std::string json = R"({
     "model": "test-model",
     "max_tokens": 8,
     "thinking": {"type": "disabled"},
     "messages": [
       {"role": "user", "content": "hello"}
     ]
-  })");
+  })";
+  if (rejects_unrepresentable_thinking(json)) {
+    return;
+  }
+  auto request = parse_request(json);
 
   xllm::proto::ChatRequest chat_request;
   ChatMessages messages;

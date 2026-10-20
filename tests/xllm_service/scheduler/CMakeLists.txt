@@ -2,6 +2,17 @@ include(cc_test)
 
 cc_test(
   NAME
+    request_output_test
+  SRCS
+    request_output_test.cpp
+  DEPS
+    :request
+    :common
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     request_metrics_test
   SRCS
     request_metrics_test.cpp

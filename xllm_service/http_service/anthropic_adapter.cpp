@@ -398,6 +398,10 @@ void fill_generation_params(
   if (anthropic_request.has_ignore_eos()) {
     chat_request->set_ignore_eos(anthropic_request.ignore_eos());
   }
+  if (anthropic_request.has_chat_template_kwargs()) {
+    *chat_request->mutable_chat_template_kwargs() =
+        anthropic_request.chat_template_kwargs();
+  }
   if (anthropic_request.has_output_config() &&
       anthropic_request.output_config().has_effort() &&
       !anthropic_request.output_config().effort().empty()) {
@@ -482,6 +486,20 @@ AnthropicAdaptResult parse_anthropic_json(
       xllm::ChatJsonParser::anthropic().preprocess(std::move(json));
   if (!preprocess_status.ok()) {
     return error_result(preprocess_status.message());
+  }
+
+  if (request->GetDescriptor()->FindFieldByName("thinking") == nullptr &&
+      processed_json.find("\"thinking\"") != std::string::npos) {
+    const auto body = nlohmann::json::parse(
+        processed_json, nullptr, /*allow_exceptions=*/false);
+    if (body.is_discarded()) {
+      return error_result("Invalid Anthropic request JSON.");
+    }
+    if (body.contains("thinking")) {
+      return error_result(
+          "thinking is not supported by the paired engine schema; use "
+          "chat_template_kwargs.enable_thinking instead.");
+    }
   }
 
   google::protobuf::util::JsonParseOptions options;

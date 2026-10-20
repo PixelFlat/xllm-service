@@ -24,6 +24,7 @@ cc_library(
   HDRS
     scheduler.h
     request_metrics.h
+    request_output.h
   SRCS
     scheduler.cpp
   DEPS
