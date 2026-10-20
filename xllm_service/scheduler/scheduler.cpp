@@ -133,7 +133,11 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
   }
 }
 
-Scheduler::~Scheduler() { etcd_client_->stop_watch(); }
+Scheduler::~Scheduler() {
+  if (etcd_client_) {
+    etcd_client_->stop_watch();
+  }
+}
 
 bool Scheduler::schedule(std::shared_ptr<Request> request) {
   // For vLLM backend clusters we forward the client's raw OpenAI JSON straight
@@ -337,157 +341,119 @@ Tokenizer* Scheduler::get_tls_tokenizer() {
 
 bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
                                    std::shared_ptr<Request> request) {
-  {
-    std::lock_guard<std::mutex> guard(request_mutex_);
-    if (requests_.find(request->service_request_id) != requests_.end()) {
-      LOG(ERROR) << "The request ID already exists. Requests with the same ID "
-                    "are not allowed. "
-                 << request->service_request_id;
-      return false;
+  request->latest_generate_time = absl::Now();
+  request->call_data = call_data;
+  request->output_callback =
+      [this, call_data, stream = request->stream](
+          const llm::RequestOutput& req_output) mutable -> bool {
+    if (req_output.status.has_value()) {
+      const auto& status = req_output.status.value();
+      if (!status.ok()) {
+        return call_data->finish_with_error(status);
+      }
     }
 
-    request->latest_generate_time = absl::Now();
-    request->call_data = call_data;
-    request->output_callback =
-        [this, call_data, stream = request->stream](
-            const llm::RequestOutput& req_output) mutable -> bool {
-      if (req_output.status.has_value()) {
-        const auto& status = req_output.status.value();
-        if (!status.ok()) {
-          return call_data->finish_with_error(status);
-        }
-      }
-
-      if (req_output.finished_on_prefill_instance) {
-        return true;
-      }
-      if (stream) {
-        return response_handler_.send_delta_to_client(call_data, req_output);
-      }
-      return response_handler_.send_result_to_client(call_data, req_output);
-    };
-    requests_.emplace(request->service_request_id, request);
-    COUNTER_INC(server_request_in_total);
-  }
-
-  {
-    // allocate thread for the request
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_[request->service_request_id] =
-        next_thread_idx;
-    next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
-  }
-
-  return true;
+    if (req_output.finished_on_prefill_instance) {
+      return true;
+    }
+    if (stream) {
+      return response_handler_.send_delta_to_client(call_data, req_output);
+    }
+    return response_handler_.send_result_to_client(call_data, req_output);
+  };
+  return publish_request(std::move(request));
 }
 
 bool Scheduler::record_new_request(std::shared_ptr<AnthropicCallData> call_data,
                                    std::shared_ptr<Request> request) {
-  {
-    std::lock_guard<std::mutex> guard(request_mutex_);
-    if (requests_.find(request->service_request_id) != requests_.end()) {
-      LOG(ERROR) << "The request ID already exists. Requests with the same ID "
-                    "are not allowed. "
-                 << request->service_request_id;
-      return false;
+  request->latest_generate_time = absl::Now();
+  auto stream_encoder =
+      request->stream ? std::make_shared<AnthropicStreamEncoder>(request->model)
+                      : nullptr;
+  request->call_data = call_data;
+  request->output_callback =
+      [this,
+       call_data,
+       model = request->model,
+       stream = request->stream,
+       stream_encoder](const llm::RequestOutput& req_output) mutable -> bool {
+    if (req_output.status.has_value()) {
+      const auto& status = req_output.status.value();
+      if (!status.ok()) {
+        return call_data->finish_with_error(status);
+      }
     }
 
-    request->latest_generate_time = absl::Now();
-    auto stream_encoder =
-        request->stream
-            ? std::make_shared<AnthropicStreamEncoder>(request->model)
-            : nullptr;
-    request->call_data = call_data;
-    request->output_callback =
-        [this,
-         call_data,
-         model = request->model,
-         stream = request->stream,
-         stream_encoder](const llm::RequestOutput& req_output) mutable -> bool {
-      if (req_output.status.has_value()) {
-        const auto& status = req_output.status.value();
-        if (!status.ok()) {
-          return call_data->finish_with_error(status);
-        }
-      }
-
-      if (req_output.finished_on_prefill_instance) {
-        return true;
-      }
-      if (stream) {
-        return response_handler_.send_delta_to_client(
-            call_data, req_output, *stream_encoder);
-      }
-      return response_handler_.send_result_to_client(
-          call_data, model, req_output);
-    };
-    requests_.emplace(request->service_request_id, request);
-    COUNTER_INC(server_request_in_total);
-  }
-
-  {
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_[request->service_request_id] =
-        next_thread_idx;
-    next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
-  }
-
-  return true;
+    if (req_output.finished_on_prefill_instance) {
+      return true;
+    }
+    if (stream) {
+      return response_handler_.send_delta_to_client(
+          call_data, req_output, *stream_encoder);
+    }
+    return response_handler_.send_result_to_client(
+        call_data, model, req_output);
+  };
+  return publish_request(std::move(request));
 }
 
 bool Scheduler::record_new_request(
     std::shared_ptr<CompletionCallData> call_data,
     std::shared_ptr<Request> request) {
-  {
-    std::lock_guard<std::mutex> guard(request_mutex_);
-    if (requests_.find(request->service_request_id) != requests_.end()) {
-      LOG(ERROR) << "The request ID already exists. Requests with the same ID "
-                    "are not allowed. "
-                 << request->service_request_id;
-      return false;
+  request->latest_generate_time = absl::Now();
+
+  request->call_data = call_data;
+  request->output_callback =
+      [this,
+       call_data,
+       model = request->model,
+       stream = request->stream,
+       include_usage = request->include_usage,
+       service_request_id = request->service_request_id,
+       created_time = absl::ToUnixSeconds(request->latest_generate_time)](
+          const llm::RequestOutput& req_output) mutable -> bool {
+    if (req_output.status.has_value()) {
+      const auto& status = req_output.status.value();
+      if (!status.ok()) {
+        return call_data->finish_with_error(status);
+      }
     }
 
-    request->latest_generate_time = absl::Now();
+    if (stream) {
+      return response_handler_.send_delta_to_client(
+          call_data, include_usage, created_time, model, req_output);
+    } else if (!req_output.finished_on_prefill_instance) {
+      // for non-stream request, only send final result from decode instance
+      return response_handler_.send_result_to_client(
+          call_data, created_time, model, req_output);
+    }
+    return true;
+  };
+  return publish_request(std::move(request));
+}
 
-    request->call_data = call_data;
-    request->output_callback =
-        [this,
-         call_data,
-         model = request->model,
-         stream = request->stream,
-         include_usage = request->include_usage,
-         service_request_id = request->service_request_id,
-         created_time = absl::ToUnixSeconds(request->latest_generate_time)](
-            const llm::RequestOutput& req_output) mutable -> bool {
-      if (req_output.status.has_value()) {
-        const auto& status = req_output.status.value();
-        if (!status.ok()) {
-          return call_data->finish_with_error(status);
-        }
-      }
-
-      if (stream) {
-        return response_handler_.send_delta_to_client(
-            call_data, include_usage, created_time, model, req_output);
-      } else if (!req_output.finished_on_prefill_instance) {
-        // for non-stream request, only send final result from decode instance
-        return response_handler_.send_result_to_client(
-            call_data, created_time, model, req_output);
-      }
-      return true;
-    };
-    requests_.emplace(request->service_request_id, request);
-    COUNTER_INC(server_request_in_total);
+bool Scheduler::publish_request(std::shared_ptr<Request> request) {
+  std::lock_guard<std::mutex> admission_lock(admission_mutex_);
+  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  if (requests_.find(request->service_request_id) != requests_.end()) {
+    LOG(ERROR) << "The request ID already exists. Requests with the same ID "
+                  "are not allowed. "
+               << request->service_request_id;
+    return false;
   }
-
-  {
-    // allocate thread for the request
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_[request->service_request_id] =
-        next_thread_idx;
-    next_thread_idx = (++next_thread_idx) % kOutputTheadNum_;
+  // schedule() precedes callback registration. The selected instance may have
+  // been removed or replaced in that interval, before cleanup could see us.
+  if (!instance_mgr_->request_instances_match(*request)) {
+    instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
+    LOG(ERROR) << "Instance changed before request admission: "
+               << request->service_request_id;
+    return false;
   }
-
+  remote_requests_output_thread_map_.emplace(request->service_request_id,
+                                             next_thread_idx);
+  next_thread_idx = (next_thread_idx + 1) % kOutputTheadNum_;
+  requests_.emplace(request->service_request_id, request);
+  COUNTER_INC(server_request_in_total);
   return true;
 }
 
@@ -504,10 +470,6 @@ void Scheduler::finish_request(const std::string& service_request_id,
           error ? RequestAction::CANCEL : RequestAction::FINISH_DECODE);
       requests_.erase(it);
     }
-  }
-
-  {
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
     remote_requests_output_thread_map_.erase(service_request_id);
   }
 }
@@ -555,7 +517,7 @@ bool Scheduler::handle_generation(llm::RequestOutput request_output) {
       request_output.status.has_value() && !request_output.status.value().ok();
 
   std::shared_ptr<Request> request;
-  bool client_disconnected = false;
+  size_t req_thread_idx = 0;
   {
     std::lock_guard<std::mutex> guard(request_mutex_);
     auto it = requests_.find(service_request_id);
@@ -574,31 +536,22 @@ bool Scheduler::handle_generation(llm::RequestOutput request_output) {
                 << service_request_id;
       requests_.erase(it);
       instance_mgr_->update_request_metrics(request, RequestAction::CANCEL);
-      client_disconnected = true;
+      remote_requests_output_thread_map_.erase(service_request_id);
+      return false;
     } else if (!status_error) {
       const bool first_token =
           update_request_metrics(request, finished_on_prefill_instance);
       update_token_latency_metrics(request, first_token);
     }
-  }
-
-  if (client_disconnected) {
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    remote_requests_output_thread_map_.erase(service_request_id);
-    return false;
-  }
-
-  size_t req_thread_idx = -1;
-  {
-    std::lock_guard<std::mutex> guard(thread_map_mutex_);
-    auto it = remote_requests_output_thread_map_.find(service_request_id);
-    if (it == remote_requests_output_thread_map_.end()) {
+    auto thread_it =
+        remote_requests_output_thread_map_.find(service_request_id);
+    if (thread_it == remote_requests_output_thread_map_.end()) {
       LOG(ERROR) << "Can not found the thread for the received request output, "
                     "request id is: "
                  << service_request_id;
       return false;
     }
-    req_thread_idx = it->second;
+    req_thread_idx = thread_it->second;
   }
 
   output_threadpools_[req_thread_idx].schedule(

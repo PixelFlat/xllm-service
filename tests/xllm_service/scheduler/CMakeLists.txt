@@ -30,3 +30,13 @@ cc_test(
     :response_handler
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    request_admission_test
+  SRCS
+    request_admission_test.cpp
+  DEPS
+    :scheduler
+    GTest::gtest_main
+)

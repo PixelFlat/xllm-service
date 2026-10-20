@@ -449,6 +449,22 @@ bool InstanceMgr::bind_request_instance_incarnations(
   return true;
 }
 
+bool InstanceMgr::request_instances_match(const Request& request) const {
+  std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
+  const auto matches = [this](const std::string& name,
+                              const std::string& incarnation_id) {
+    if (name.empty()) {
+      return true;
+    }
+    auto it = instances_.find(name);
+    return it != instances_.end() && is_instance_schedulable(it->second) &&
+           it->second.incarnation_id == incarnation_id;
+  };
+  return matches(request.routing.prefill_name,
+                 request.prefill_incarnation_id) &&
+         matches(request.routing.decode_name, request.decode_incarnation_id);
+}
+
 bool InstanceMgr::record_instance_heartbeat(const std::string& instance_name,
                                             const std::string& incarnation_id) {
   std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
@@ -847,11 +863,19 @@ void InstanceMgr::update_request_metrics(
   // An instance may disappear after KV handoff. Release the surviving peer's
   // reservation even when the failed peer's metrics have already been removed.
   auto prefill_it = request_metrics_.find(request->routing.prefill_name);
-  if (prefill_it != request_metrics_.end()) {
+  auto prefill_instance = instances_.find(request->routing.prefill_name);
+  if (prefill_it != request_metrics_.end() &&
+      prefill_instance != instances_.end() &&
+      prefill_instance->second.incarnation_id ==
+          request->prefill_incarnation_id) {
     apply_prefill_request_metrics(*request, action, prefill_it->second);
   }
   auto decode_it = request_metrics_.find(request->routing.decode_name);
-  if (decode_it != request_metrics_.end()) {
+  auto decode_instance = instances_.find(request->routing.decode_name);
+  if (decode_it != request_metrics_.end() &&
+      decode_instance != instances_.end() &&
+      decode_instance->second.incarnation_id ==
+          request->decode_incarnation_id) {
     apply_decode_request_metrics(*request, action, decode_it->second);
     if (decode_it->second.decode_request_num == 0) {
       flip_decode_to_prefill(request->routing.decode_name);
@@ -1193,10 +1217,14 @@ void InstanceMgr::deregister_instance(
     call_unlink_instance(op.first, op.second);
   }
 
+  // Admission revalidates the bound incarnation under this same barrier.
+  // Keep it held until removal is complete, including queued cancellations.
+  std::lock_guard<std::mutex> admission_lock(scheduler_->admission_mutex_);
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
     auto it = instances_.find(name);
-    if (it == instances_.end()) {
+    if (it == instances_.end() ||
+        it->second.incarnation_id != info.incarnation_id) {
       return;
     }
     remove_instance_from_index(name, it->second);

@@ -86,7 +86,13 @@ class Scheduler final {
                                     bool first_token);
 
  private:
+  friend class InstanceMgr;
+  friend class SchedulerTestPeer;
+
+  Scheduler() = default;
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
+
+  bool publish_request(std::shared_ptr<Request> request);
 
   void update_master_service_heartbeat();
 
@@ -128,6 +134,10 @@ class Scheduler final {
   std::unordered_map<std::string, std::shared_ptr<Request>> requests_;
   std::mutex request_mutex_;
 
+  // Serializes final admission with instance removal. Lock before
+  // request_mutex_ and InstanceMgr's cluster/metrics locks.
+  std::mutex admission_mutex_;
+
   // use threadpool to handle all RequestOuputs queue
   static constexpr size_t kOutputTheadNum_ = 128;  // magic num
   ThreadPool output_threadpools_[kOutputTheadNum_];
@@ -135,7 +145,6 @@ class Scheduler final {
   // order.
   std::unordered_map<std::string, size_t> remote_requests_output_thread_map_;
   size_t next_thread_idx = 0;
-  std::mutex thread_map_mutex_;
 
   // used when receive token from decode instance.
   ResponseHandler response_handler_;
