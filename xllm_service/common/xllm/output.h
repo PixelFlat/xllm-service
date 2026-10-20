@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "chat.pb.h"
 #include "status.h"
 
 namespace xllm_service {
@@ -106,6 +107,10 @@ struct RequestOutput {
   // the output for each sequence in the request.
   std::vector<SequenceOutput> outputs;
 
+  // Already parsed by the engine. Empty means parser buffering; absent means
+  // the sender does not implement structured chat output.
+  std::optional<std::vector<xllm::proto::ChatResponse>> chat_frames;
+
   // the statistics for the request.
   std::optional<Usage> usage;
 
@@ -134,6 +139,6 @@ inline std::optional<std::string> to_string(FinishReason reason) {
 
 }  // namespace llm
 
-using OutputCallback = std::function<bool(llm::RequestOutput output)>;
+using OutputCallback = std::function<bool(const llm::RequestOutput& output)>;
 
 }  // namespace xllm_service

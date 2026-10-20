@@ -82,6 +82,11 @@ RequestOutputConversionResult request_output_from_disagg_generation(
   request_output.finished_on_prefill_instance =
       generation.finished_on_prefill_instance();
   request_output.finished = generation.finished();
+  if (generation.has_chat_output()) {
+    request_output.chat_frames.emplace(
+        generation.chat_output().frames().begin(),
+        generation.chat_output().frames().end());
+  }
   request_output.outputs.reserve(generation.outputs_size());
   for (const proto::SequenceOutput& output : generation.outputs()) {
     llm::SequenceOutput sequence_output;

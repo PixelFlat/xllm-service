@@ -74,18 +74,25 @@ class Scheduler final {
                                          InstanceType type);
 
   // handle generations from prefill/decode instance
-  bool handle_generation(const llm::RequestOutput& request_output);
+  bool handle_generation(llm::RequestOutput request_output);
 
-  // update request metrics for prefill finished request
-  void update_request_metrics(std::shared_ptr<Request> request,
+  // Returns true only for the first successful output completing Prefill.
+  // The caller holds request_mutex_ while changing request progress.
+  bool update_request_metrics(const std::shared_ptr<Request>& request,
                               bool finished_on_prefill_instance);
 
   // update token latency metrics
-  void update_token_latency_metrics(std::shared_ptr<Request> request,
-                                    bool finished_on_prefill_instance);
+  void update_token_latency_metrics(const std::shared_ptr<Request>& request,
+                                    bool first_token);
 
  private:
+  friend class InstanceMgr;
+  friend class SchedulerTestPeer;
+
+  Scheduler() = default;
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
+
+  bool publish_request(std::shared_ptr<Request> request);
 
   void update_master_service_heartbeat();
 
@@ -111,10 +118,6 @@ class Scheduler final {
   // chat template instance
   std::unique_ptr<ChatTemplate> chat_template_;
 
-  // Parser formats resolved once from config.json model_type.
-  std::string tool_call_parser_format_;
-  std::string reasoning_parser_format_;
-
   std::shared_ptr<EtcdClient> etcd_client_;
 
   std::unique_ptr<Tokenizer> tokenizer_;
@@ -131,6 +134,10 @@ class Scheduler final {
   std::unordered_map<std::string, std::shared_ptr<Request>> requests_;
   std::mutex request_mutex_;
 
+  // Serializes final admission with instance removal. Lock before
+  // request_mutex_ and InstanceMgr's cluster/metrics locks.
+  std::mutex admission_mutex_;
+
   // use threadpool to handle all RequestOuputs queue
   static constexpr size_t kOutputTheadNum_ = 128;  // magic num
   ThreadPool output_threadpools_[kOutputTheadNum_];
@@ -138,7 +145,6 @@ class Scheduler final {
   // order.
   std::unordered_map<std::string, size_t> remote_requests_output_thread_map_;
   size_t next_thread_idx = 0;
-  std::mutex thread_map_mutex_;
 
   // used when receive token from decode instance.
   ResponseHandler response_handler_;

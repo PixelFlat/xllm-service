@@ -63,6 +63,7 @@ class InstanceMgr final {
 
   bool bind_request_instance_incarnations(
       const std::shared_ptr<Request>& request);
+  bool request_instances_match(const Request& request) const;
   bool record_instance_heartbeat(const std::string& instance_name,
                                  const std::string& incarnation_id);
   void record_load_metrics_update(const std::string& instance_name,
@@ -74,7 +75,7 @@ class InstanceMgr final {
                               const proto::LatencyMetrics& latency_metrics);
 
   // update request metrics under different actions
-  void update_request_metrics(std::shared_ptr<Request> request,
+  void update_request_metrics(const std::shared_ptr<Request>& request,
                               RequestAction action);
 
   // select instances based on the SLO
@@ -90,6 +91,9 @@ class InstanceMgr final {
   bool has_available_instances() const;
 
  private:
+  friend class SchedulerTestPeer;
+
+  InstanceMgr() = default;
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
 
   // Caller must hold cluster_mutex_.

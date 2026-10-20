@@ -55,23 +55,12 @@ class AnthropicStreamEncoder {
   AnthropicAdaptResult finish(const llm::RequestOutput& output,
                               std::vector<std::string>* out);
 
-  // State the orchestration layer reads/writes while deciding how to split an
-  // incoming chunk (reasoning boundary vs tool boundary).
-  bool pending_tool_call() const { return state_.pending_tool_call; }
-  void set_pending_tool_call(bool pending) {
-    state_.pending_tool_call = pending;
-  }
-  const std::string& last_content_block_type() const {
-    return state_.last_content_block_type;
-  }
-
  private:
   // Content-block state machine (formerly the public AnthropicStreamState,
   // now an internal implementation detail of the encoder).
   struct State {
     bool message_started = false;
     bool has_tool_call = false;
-    bool pending_tool_call = false;
     int32_t content_block_index = -1;
     std::string last_content_block_type;
     std::string thinking_signature;

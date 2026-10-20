@@ -75,6 +75,9 @@ struct Request {
   // output callback
   OutputCallback output_callback;
 
+  // Accessed only by this request's output thread.
+  bool output_finished = false;
+
   std::shared_ptr<CallData> call_data;
 
   // trace callback

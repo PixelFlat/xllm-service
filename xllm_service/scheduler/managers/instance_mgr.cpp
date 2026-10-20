@@ -37,6 +37,7 @@ limitations under the License.
 #include "common/xllm/output.h"
 #include "common/xllm/status.h"
 #include "disagg_pd.pb.h"
+#include "scheduler/request_metrics.h"
 #include "scheduler/scheduler.h"
 
 namespace {
@@ -448,6 +449,22 @@ bool InstanceMgr::bind_request_instance_incarnations(
   return true;
 }
 
+bool InstanceMgr::request_instances_match(const Request& request) const {
+  std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
+  const auto matches = [this](const std::string& name,
+                              const std::string& incarnation_id) {
+    if (name.empty()) {
+      return true;
+    }
+    auto it = instances_.find(name);
+    return it != instances_.end() && is_instance_schedulable(it->second) &&
+           it->second.incarnation_id == incarnation_id;
+  };
+  return matches(request.routing.prefill_name,
+                 request.prefill_incarnation_id) &&
+         matches(request.routing.decode_name, request.decode_incarnation_id);
+}
+
 bool InstanceMgr::record_instance_heartbeat(const std::string& instance_name,
                                             const std::string& incarnation_id) {
   std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
@@ -832,8 +849,9 @@ void InstanceMgr::clear_suspect_instance(const std::string& name,
   suspect_instances_.erase(it);
 }
 
-void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
-                                         RequestAction action) {
+void InstanceMgr::update_request_metrics(
+    const std::shared_ptr<Request>& request,
+    RequestAction action) {
   // skip request metrics update if policy is not SLO_AWARE
   if (options_.load_balance_policy() != "SLO_AWARE") {
     return;
@@ -842,73 +860,26 @@ void InstanceMgr::update_request_metrics(std::shared_ptr<Request> request,
   std::scoped_lock<std::shared_mutex, std::shared_mutex> lock(cluster_mutex_,
                                                               metrics_mutex_);
 
+  // An instance may disappear after KV handoff. Release the surviving peer's
+  // reservation even when the failed peer's metrics have already been removed.
   auto prefill_it = request_metrics_.find(request->routing.prefill_name);
-  if (prefill_it == request_metrics_.end()) {
-    LOG(ERROR) << "Failed to find instance request metrics, instance name : "
-               << request->routing.prefill_name;
-    return;
+  auto prefill_instance = instances_.find(request->routing.prefill_name);
+  if (prefill_it != request_metrics_.end() &&
+      prefill_instance != instances_.end() &&
+      prefill_instance->second.incarnation_id ==
+          request->prefill_incarnation_id) {
+    apply_prefill_request_metrics(*request, action, prefill_it->second);
   }
-
   auto decode_it = request_metrics_.find(request->routing.decode_name);
-  if (decode_it == request_metrics_.end()) {
-    LOG(ERROR) << "Failed to find instance request metrics, instance name : "
-               << request->routing.decode_name;
-    return;
-  }
-
-  int64_t num_prompt_tokens = request->token_ids.size();
-  int64_t num_generated_tokens = request->num_generated_tokens;
-  switch (action) {
-    case RequestAction::SCHEDULE:
-      // update the request metrics for prefill and decode instances when
-      // request is scheduled
-      prefill_it->second.prefill_request_num += 1;
-      prefill_it->second.prefill_token_num += num_prompt_tokens;
-
-      decode_it->second.decode_request_num += 1;
-      decode_it->second.decode_token_num += num_prompt_tokens;
-      break;
-    case RequestAction::FINISH_PREFILL:
-      // update the request metrics for prefill and decode instance when request
-      // finishes the prefill phase
-      prefill_it->second.prefill_request_num -= 1;
-      prefill_it->second.prefill_token_num -= num_prompt_tokens;
-      prefill_it->second.estimated_prefill_time -= request->estimated_ttft;
-
-      decode_it->second.decode_token_num += 1;
-      break;
-    case RequestAction::GENERATE:
-      // update the request metrics for decode instance when request generate a
-      // token
-      decode_it->second.decode_token_num += 1;
-      break;
-    case RequestAction::FINISH_DECODE:
-      // update the request metrics for decode instance when request finishes
-      // the decode phase
-      decode_it->second.decode_request_num -= 1;
-      decode_it->second.decode_token_num -=
-          (num_prompt_tokens + num_generated_tokens);
-
-      break;
-    case RequestAction::CANCEL:
-      // update the request metrics for prefill and decode instances when
-      // request is cancelled
-      prefill_it->second.prefill_request_num -= 1;
-      prefill_it->second.prefill_token_num -= num_prompt_tokens;
-      prefill_it->second.estimated_prefill_time -= request->estimated_ttft;
-
-      decode_it->second.decode_request_num -= 1;
-      decode_it->second.decode_token_num -=
-          (num_prompt_tokens + num_generated_tokens);
-
-      break;
-    default:
-      LOG(ERROR) << "Unknown RequestAction: " << static_cast<int32_t>(action);
-      break;
-  }
-
-  if (decode_it->second.decode_request_num == 0) {
-    flip_decode_to_prefill(request->routing.decode_name);
+  auto decode_instance = instances_.find(request->routing.decode_name);
+  if (decode_it != request_metrics_.end() &&
+      decode_instance != instances_.end() &&
+      decode_instance->second.incarnation_id ==
+          request->decode_incarnation_id) {
+    apply_decode_request_metrics(*request, action, decode_it->second);
+    if (decode_it->second.decode_request_num == 0) {
+      flip_decode_to_prefill(request->routing.decode_name);
+    }
   }
 }
 
@@ -1246,10 +1217,14 @@ void InstanceMgr::deregister_instance(
     call_unlink_instance(op.first, op.second);
   }
 
+  // Admission revalidates the bound incarnation under this same barrier.
+  // Keep it held until removal is complete, including queued cancellations.
+  std::lock_guard<std::mutex> admission_lock(scheduler_->admission_mutex_);
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);
     auto it = instances_.find(name);
-    if (it == instances_.end()) {
+    if (it == instances_.end() ||
+        it->second.incarnation_id != info.incarnation_id) {
       return;
     }
     remove_instance_from_index(name, it->second);

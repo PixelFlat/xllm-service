@@ -19,6 +19,7 @@ limitations under the License.
 #include <google/protobuf/util/json_util.h>
 #include <gtest/gtest.h>
 
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -93,6 +94,59 @@ TEST(CallDataTest, NonStreamFinishWithErrorMarksControllerFailed) {
     EXPECT_EQ(controller.ErrorText(), "encode failed");
   }
 
+  EXPECT_TRUE(done.ran);
+}
+
+TEST(CallDataTest, NativeErrorsPreserveHttpStatusAndEscapeMessages) {
+  for (const auto& [code, expected_http] :
+       {std::pair{llm::StatusCode::INVALID_ARGUMENT, 400},
+        std::pair{llm::StatusCode::RESOURCE_EXHAUSTED, 429},
+        std::pair{llm::StatusCode::UNAVAILABLE, 503}}) {
+    brpc::Controller controller;
+    xllm::proto::ChatRequest request;
+    xllm::proto::ChatResponse response;
+    TestClosure done;
+    const std::string message = "invalid \"参数\"\nretry later";
+    {
+      ChatCallData call_data(&controller,
+                             /*stream=*/false,
+                             &done,
+                             &request,
+                             &response);
+      ASSERT_TRUE(call_data.finish_with_error(llm::Status(code, message)));
+      EXPECT_FALSE(controller.Failed());
+      EXPECT_EQ(controller.http_response().status_code(), expected_http);
+      EXPECT_EQ(controller.http_response().content_type(), "application/json");
+      const auto json =
+          nlohmann::json::parse(controller.response_attachment().to_string());
+      EXPECT_EQ(json["error"]["message"], message);
+      EXPECT_EQ(json["error"]["code"], expected_http);
+    }
+    EXPECT_TRUE(done.ran);
+  }
+}
+
+TEST(CallDataTest, NativeAnthropicErrorUsesMessagesEnvelope) {
+  brpc::Controller controller;
+  xllm::proto::ChatRequest request;
+  xllm::proto::AnthropicMessagesResponse response;
+  TestClosure done;
+  {
+    AnthropicCallData call_data(&controller,
+                                /*stream=*/false,
+                                &done,
+                                &request,
+                                &response);
+    ASSERT_TRUE(call_data.finish_with_error(
+        llm::Status(llm::StatusCode::INVALID_ARGUMENT, "invalid input")));
+    EXPECT_FALSE(controller.Failed());
+    EXPECT_EQ(controller.http_response().status_code(), 400);
+    const auto json =
+        nlohmann::json::parse(controller.response_attachment().to_string());
+    EXPECT_EQ(json["type"], "error");
+    EXPECT_EQ(json["error"]["type"], "invalid_request_error");
+    EXPECT_EQ(json["error"]["message"], "invalid input");
+  }
   EXPECT_TRUE(done.ran);
 }
 

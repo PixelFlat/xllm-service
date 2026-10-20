@@ -65,7 +65,55 @@ bool omit_empty_tool_calls(std::string* response_json, std::string* error) {
 
 }  // namespace
 
-bool ChatCallData::write_and_finish(::xllm::proto::ChatResponse& response) {
+std::pair<int32_t, std::string> serialize_http_error(const llm::Status& status,
+                                                     bool anthropic) {
+  CHECK(!status.ok());
+  int32_t http_status = 500;
+  const char* error_type = "server_error";
+  switch (status.code()) {
+    case llm::StatusCode::INVALID_ARGUMENT:
+      http_status = 400;
+      error_type = "invalid_request_error";
+      break;
+    case llm::StatusCode::RESOURCE_EXHAUSTED:
+      http_status = 429;
+      error_type = "rate_limit_error";
+      break;
+    case llm::StatusCode::UNAUTHENTICATED:
+      http_status = 401;
+      error_type = "authentication_error";
+      break;
+    case llm::StatusCode::UNAVAILABLE:
+      http_status = 503;
+      break;
+    case llm::StatusCode::DEADLINE_EXCEEDED:
+      http_status = 504;
+      break;
+    case llm::StatusCode::UNIMPLEMENTED:
+      http_status = 501;
+      break;
+    case llm::StatusCode::CANCELLED:
+      http_status = 499;
+      break;
+    default:
+      break;
+  }
+  nlohmann::json response = {
+      {"error", {{"message", status.message()}, {"type", error_type}}}};
+  if (anthropic) {
+    response["type"] = "error";
+    if (http_status >= 500) {
+      response["error"]["type"] = "api_error";
+    }
+  } else {
+    response["error"]["param"] = nullptr;
+    response["error"]["code"] = http_status;
+  }
+  return {http_status, response.dump()};
+}
+
+bool ChatCallData::write_and_finish(
+    const ::xllm::proto::ChatResponse& response) {
   std::string response_json;
   std::string error;
   if (!serialize_response(response, &response_json, &error) ||
@@ -75,7 +123,7 @@ bool ChatCallData::write_and_finish(::xllm::proto::ChatResponse& response) {
   return Base::write_and_finish(response_json);
 }
 
-bool ChatCallData::write(::xllm::proto::ChatResponse& response) {
+bool ChatCallData::write(const ::xllm::proto::ChatResponse& response) {
   std::string response_json;
   std::string error;
   if (!serialize_response(response, &response_json, &error) ||

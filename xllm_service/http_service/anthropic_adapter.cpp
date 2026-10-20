@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "http_service/anthropic_adapter.h"
 
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
 #include <google/protobuf/util/json_util.h>
 #include <json2pb/pb_to_json.h>
 
@@ -348,6 +350,31 @@ AnthropicAdaptResult add_content_msg(
   }
 }
 
+bool is_legacy_thinking_enabled(
+    const xllm::proto::AnthropicMessagesRequest& request) {
+  // Newer engine schemas reserve this legacy field. Keep the old schema's
+  // mapping without requiring its generated accessor in paired builds.
+  const auto* thinking_field =
+      request.GetDescriptor()->FindFieldByName("thinking");
+  const auto* reflection = request.GetReflection();
+  if (thinking_field == nullptr ||
+      thinking_field->cpp_type() !=
+          google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE ||
+      !reflection->HasField(request, thinking_field)) {
+    return false;
+  }
+  const auto& thinking = reflection->GetMessage(request, thinking_field);
+  const auto* type_field = thinking.GetDescriptor()->FindFieldByName("type");
+  if (type_field == nullptr ||
+      type_field->cpp_type() !=
+          google::protobuf::FieldDescriptor::CPPTYPE_STRING) {
+    return false;
+  }
+  const std::string type =
+      thinking.GetReflection()->GetString(thinking, type_field);
+  return type == "adaptive" || type == "enabled";
+}
+
 void fill_generation_params(
     const xllm::proto::AnthropicMessagesRequest& anthropic_request,
     xllm::proto::ChatRequest* chat_request) {
@@ -371,6 +398,10 @@ void fill_generation_params(
   if (anthropic_request.has_ignore_eos()) {
     chat_request->set_ignore_eos(anthropic_request.ignore_eos());
   }
+  if (anthropic_request.has_chat_template_kwargs()) {
+    *chat_request->mutable_chat_template_kwargs() =
+        anthropic_request.chat_template_kwargs();
+  }
   if (anthropic_request.has_output_config() &&
       anthropic_request.output_config().has_effort() &&
       !anthropic_request.output_config().effort().empty()) {
@@ -378,9 +409,7 @@ void fill_generation_params(
           ->mutable_fields())["reasoning_effort"]
         .set_string_value(anthropic_request.output_config().effort());
   }
-  if (anthropic_request.has_thinking() &&
-      (anthropic_request.thinking().type() == "adaptive" ||
-       anthropic_request.thinking().type() == "enabled")) {
+  if (is_legacy_thinking_enabled(anthropic_request)) {
     (*chat_request->mutable_chat_template_kwargs()
           ->mutable_fields())["thinking"]
         .set_bool_value(true);
@@ -457,6 +486,20 @@ AnthropicAdaptResult parse_anthropic_json(
       xllm::ChatJsonParser::anthropic().preprocess(std::move(json));
   if (!preprocess_status.ok()) {
     return error_result(preprocess_status.message());
+  }
+
+  if (request->GetDescriptor()->FindFieldByName("thinking") == nullptr &&
+      processed_json.find("\"thinking\"") != std::string::npos) {
+    const auto body = nlohmann::json::parse(
+        processed_json, nullptr, /*allow_exceptions=*/false);
+    if (body.is_discarded()) {
+      return error_result("Invalid Anthropic request JSON.");
+    }
+    if (body.contains("thinking")) {
+      return error_result(
+          "thinking is not supported by the paired engine schema; use "
+          "chat_template_kwargs.enable_thinking instead.");
+    }
   }
 
   google::protobuf::util::JsonParseOptions options;
