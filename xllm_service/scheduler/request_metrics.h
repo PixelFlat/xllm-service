@@ -39,7 +39,8 @@ inline void apply_prefill_request_metrics(const Request& request,
     ++metrics.prefill_request_num;
     metrics.prefill_token_num += prompt_tokens;
   } else if (action == RequestAction::FINISH_PREFILL ||
-             (action == RequestAction::CANCEL &&
+             ((action == RequestAction::FINISH_DECODE ||
+               action == RequestAction::CANCEL) &&
               !request.prefill_stage_finished)) {
     --metrics.prefill_request_num;
     metrics.prefill_token_num -= prompt_tokens;

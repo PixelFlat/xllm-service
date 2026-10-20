@@ -119,5 +119,37 @@ TEST_F(RequestMetricsTest, RequestsWithoutDecodeRouteKeepLegacyStageSemantics) {
   EXPECT_TRUE(request_.prefill_stage_finished);
 }
 
+TEST_F(RequestMetricsTest, DefaultRouteFinishReleasesPendingPrefill) {
+  request_.routing.decode_name.clear();
+  EXPECT_FALSE(
+      record_generation(request_, /*finished_on_prefill_instance=*/false));
+  EXPECT_FALSE(
+      record_generation(request_, /*finished_on_prefill_instance=*/false));
+  ASSERT_FALSE(request_.prefill_stage_finished);
+  ASSERT_EQ(prefill_.prefill_request_num, 1);
+
+  apply_prefill_request_metrics(
+      request_, RequestAction::FINISH_DECODE, prefill_);
+
+  EXPECT_EQ(prefill_.prefill_request_num, 0);
+  EXPECT_EQ(prefill_.prefill_token_num, 0);
+  EXPECT_EQ(prefill_.estimated_prefill_time, 0);
+}
+
+TEST_F(RequestMetricsTest, DefaultRouteFinishKeepsReleasedPrefillUnchanged) {
+  request_.routing.decode_name.clear();
+  ASSERT_TRUE(
+      record_generation(request_, /*finished_on_prefill_instance=*/true));
+  apply_prefill_request_metrics(
+      request_, RequestAction::FINISH_PREFILL, prefill_);
+
+  apply_prefill_request_metrics(
+      request_, RequestAction::FINISH_DECODE, prefill_);
+
+  EXPECT_EQ(prefill_.prefill_request_num, 0);
+  EXPECT_EQ(prefill_.prefill_token_num, 0);
+  EXPECT_EQ(prefill_.estimated_prefill_time, 0);
+}
+
 }  // namespace
 }  // namespace xllm_service
