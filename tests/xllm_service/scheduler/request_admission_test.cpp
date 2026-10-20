@@ -16,12 +16,14 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "scheduler/scheduler.h"
@@ -194,28 +196,56 @@ TEST_F(RequestAdmissionTest, DecodeReplacementKeepsItsNewMetricsUntouched) {
   EXPECT_EQ(prefill.prefill_token_num, 0);
 }
 
-TEST_F(RequestAdmissionTest, PublishedRequestIsCancelledOnItsOutputWorker) {
-  auto request = make_request("published-before-removal");
+TEST_F(RequestAdmissionTest, QueuedGenerationPrecedesCancellation) {
+  auto request = make_request("queued-generation");
   ASSERT_TRUE(SchedulerTestPeer::bind(*scheduler_, request));
-  std::atomic<int32_t> cancellations{0};
+  auto entered = std::make_shared<std::promise<void>>();
+  auto started = entered->get_future();
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  auto phase = std::make_shared<std::atomic<int32_t>>(0);
+  auto worker = std::make_shared<std::thread::id>();
   request->output_callback =
-      [&cancellations](const llm::RequestOutput& output) {
-        EXPECT_TRUE(output.status.has_value());
+      [entered, released, phase, worker](const llm::RequestOutput& output) {
         if (output.status.has_value()) {
           EXPECT_EQ(output.status->code(), llm::StatusCode::CANCELLED);
+          EXPECT_EQ(std::this_thread::get_id(), *worker);
+          EXPECT_EQ(phase->fetch_add(1), 2);
+          return true;
         }
-        ++cancellations;
+        *worker = std::this_thread::get_id();
+        EXPECT_EQ(phase->fetch_add(1), 0);
+        entered->set_value();
+        EXPECT_EQ(released.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_EQ(phase->fetch_add(1), 1);
         return true;
       };
   ASSERT_TRUE(SchedulerTestPeer::publish(*scheduler_, request));
-  ASSERT_TRUE(
+  llm::RequestOutput output;
+  output.service_request_id = request->service_request_id;
+  ASSERT_TRUE(scheduler_->handle_generation(std::move(output)));
+  const auto ready = started.wait_for(std::chrono::seconds(5));
+  if (ready != std::future_status::ready) {
+    release.set_value();
+    FAIL() << "The request output worker did not start";
+  }
+
+  // A successful Decode output closes Prefill. Fail Decode while that
+  // output's callback is blocked, exercising the real cancellation route.
+  SchedulerTestPeer::remove(*scheduler_, "decode");
+  EXPECT_EQ(phase->load(), 1);
+  EXPECT_TRUE(
       SchedulerTestPeer::contains(*scheduler_, request->service_request_id));
-  SchedulerTestPeer::remove(*scheduler_, "prefill");
+  release.set_value();
   SchedulerTestPeer::drain(*scheduler_);
-  EXPECT_EQ(cancellations.load(), 1);
+  EXPECT_EQ(phase->load(), 3);
   EXPECT_FALSE(
       SchedulerTestPeer::contains(*scheduler_, request->service_request_id));
-  expect_decode_released();
+  const RequestMetrics prefill =
+      SchedulerTestPeer::metrics(*scheduler_, "prefill");
+  EXPECT_EQ(prefill.prefill_request_num, 0);
+  EXPECT_EQ(prefill.prefill_token_num, 0);
 }
 
 TEST_F(RequestAdmissionTest, ConcurrentRemovalCannotOrphanRequest) {

@@ -7,7 +7,6 @@ cc_test(
     request_output_test.cpp
   DEPS
     :request
-    :common
     GTest::gtest_main
 )
 

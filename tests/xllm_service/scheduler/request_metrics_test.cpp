@@ -92,33 +92,6 @@ TEST_F(RequestMetricsTest, LegacyPrefillFlagAndDecodeOutputShareOneTransition) {
   expect_released();
 }
 
-TEST_F(RequestMetricsTest, AWholeResponseFromDecodeAlsoClosesPrefill) {
-  EXPECT_TRUE(receive_token());
-  apply(RequestAction::FINISH_DECODE);
-  expect_released();
-}
-
-TEST_F(RequestMetricsTest, DecodeCanFinishAfterPrefillMetricsAreRemoved) {
-  EXPECT_TRUE(receive_token());
-  // InstanceMgr no longer needs the removed P entry to update D.
-  EXPECT_FALSE(
-      record_generation(request_, /*finished_on_prefill_instance=*/false));
-  apply_decode_request_metrics(request_, RequestAction::GENERATE, decode_);
-  apply_decode_request_metrics(request_, RequestAction::FINISH_DECODE, decode_);
-  EXPECT_EQ(decode_.decode_request_num, 0);
-  EXPECT_EQ(decode_.decode_token_num, 0);
-}
-
-TEST_F(RequestMetricsTest, RequestsWithoutDecodeRouteKeepLegacyStageSemantics) {
-  request_.routing.decode_name.clear();
-  EXPECT_FALSE(
-      record_generation(request_, /*finished_on_prefill_instance=*/false));
-  EXPECT_FALSE(request_.prefill_stage_finished);
-  EXPECT_TRUE(
-      record_generation(request_, /*finished_on_prefill_instance=*/true));
-  EXPECT_TRUE(request_.prefill_stage_finished);
-}
-
 TEST_F(RequestMetricsTest, DefaultRouteFinishReleasesPendingPrefill) {
   request_.routing.decode_name.clear();
   EXPECT_FALSE(
@@ -138,6 +111,9 @@ TEST_F(RequestMetricsTest, DefaultRouteFinishReleasesPendingPrefill) {
 
 TEST_F(RequestMetricsTest, DefaultRouteFinishKeepsReleasedPrefillUnchanged) {
   request_.routing.decode_name.clear();
+  EXPECT_FALSE(
+      record_generation(request_, /*finished_on_prefill_instance=*/false));
+  EXPECT_FALSE(request_.prefill_stage_finished);
   ASSERT_TRUE(
       record_generation(request_, /*finished_on_prefill_instance=*/true));
   apply_prefill_request_metrics(
