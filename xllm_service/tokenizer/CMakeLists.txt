@@ -8,6 +8,7 @@ cc_library(
   HDRS
     tokenizer_args.h
     tokenizer.h
+    tokenizer_pool.h
     tokenizer_factory.h
     tiktoken_tokenizer.h
     sentencepiece_tokenizer.h
@@ -15,6 +16,7 @@ cc_library(
   SRCS
     tokenizer_args.cpp
     tokenizer_factory.cpp
+    tokenizer_pool.cpp
     tiktoken_tokenizer.cpp
     sentencepiece_tokenizer.cpp
     fast_tokenizer.cpp

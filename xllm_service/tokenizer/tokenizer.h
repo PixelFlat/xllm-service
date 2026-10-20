@@ -15,6 +15,8 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+#include <glog/logging.h>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -42,6 +44,15 @@ class Tokenizer {
   virtual std::string id_to_token(int32_t id) const = 0;
 
   virtual size_t vocab_size() const = 0;
+
+  // Exercise both directions before this instance is made available to
+  // requests.
+  virtual void warmup() const {
+    std::vector<int32_t> ids;
+    CHECK(encode("warmup", &ids));
+    (void)decode(ids, /*skip_special_tokens=*/false);
+    (void)decode(ids, /*skip_special_tokens=*/true);
+  }
 
   virtual std::unique_ptr<Tokenizer> clone() const = 0;
 };

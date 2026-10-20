@@ -27,8 +27,8 @@ limitations under the License.
 #include "managers/instance_mgr.h"
 #include "request/request.h"
 #include "response_handler.h"
-#include "tokenizer/tokenizer.h"
 #include "tokenizer/tokenizer_args.h"
+#include "tokenizer/tokenizer_pool.h"
 
 namespace xllm_service {
 
@@ -104,8 +104,6 @@ class Scheduler final {
   void handle_xservice_watch(const etcd::Response& response,
                              const uint64_t& prefix_len);
 
-  Tokenizer* get_tls_tokenizer();
-
  private:
   Options options_;
 
@@ -120,7 +118,7 @@ class Scheduler final {
 
   std::shared_ptr<EtcdClient> etcd_client_;
 
-  std::unique_ptr<Tokenizer> tokenizer_;
+  std::unique_ptr<TokenizerPool> tokenizer_pool_;
 
   std::shared_ptr<InstanceMgr> instance_mgr_;
 

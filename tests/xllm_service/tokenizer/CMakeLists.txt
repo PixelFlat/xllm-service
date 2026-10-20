@@ -9,3 +9,13 @@ cc_test(
     :tokenizer
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    tokenizer_pool_test
+  SRCS
+    tokenizer_pool_test.cpp
+  DEPS
+    :tokenizer
+    GTest::gtest_main
+)

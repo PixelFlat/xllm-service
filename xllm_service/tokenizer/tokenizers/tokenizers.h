@@ -41,6 +41,9 @@ void tokenizers_encode(TokenizerHandle handle,
                        int add_special_token,
                        TokenizerEncodeResult* result);
 
+void tokenizers_free_encode_results(TokenizerEncodeResult* results,
+                                    size_t num_seqs);
+
 void tokenizers_decode(TokenizerHandle handle,
                        const uint32_t* data,
                        size_t len,
