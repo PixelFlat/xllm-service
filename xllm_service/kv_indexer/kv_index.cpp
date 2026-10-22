@@ -163,6 +163,8 @@ bool KVIndex::apply(const KVEventBatch& batch) {
   if (snapshot) {
     return restore(batch, {});
   }
+  // Destroy failed state after releasing the lock, as in invalidate().
+  std::unique_ptr<State> retired;
   std::unique_lock lock(mutex_);
   if (!synchronized_) {
     return false;
@@ -171,7 +173,8 @@ bool KVIndex::apply(const KVEventBatch& batch) {
     return true;
   }
   if (batch.sequence != sequence_ + 1 || !apply_events(*state_, batch.events)) {
-    state_ = std::make_unique<State>();
+    retired = std::make_unique<State>();
+    state_.swap(retired);
     synchronized_ = false;
     error_ = "sequence gap, unresolved content, or index capacity exceeded";
     return false;
