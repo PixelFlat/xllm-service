@@ -22,8 +22,8 @@ limitations under the License.
 #include "common/threadpool.h"
 #include "common/xllm/output.h"
 #include "etcd_client/etcd_client.h"
+#include "kv_indexer/kv_directory.h"
 #include "loadbalance_policy/loadbalance_policy.h"
-#include "managers/global_kvcache_mgr.h"
 #include "managers/instance_mgr.h"
 #include "request/request.h"
 #include "response_handler.h"
@@ -56,6 +56,8 @@ class Scheduler final {
 
   // Returns true if at least one valid instance group is available.
   bool has_available_instances() const;
+
+  const KVDirectory* kv_directory() const { return kv_directory_.get(); }
 
   // register new requests from http service
   // keep http callback util request finished.
@@ -94,6 +96,8 @@ class Scheduler final {
 
   bool publish_request(std::shared_ptr<Request> request);
 
+  void start_kv_event_discovery();
+
   void update_master_service_heartbeat();
 
   bool register_current_service();
@@ -122,7 +126,8 @@ class Scheduler final {
 
   std::shared_ptr<InstanceMgr> instance_mgr_;
 
-  std::shared_ptr<GlobalKVCacheMgr> global_kvcache_mgr_;
+  // Asynchronous KV metadata shared by CAR and the internal query API.
+  std::unique_ptr<KVDirectory> kv_directory_;
 
   std::unique_ptr<LoadBalancePolicy> lb_policy_;
 

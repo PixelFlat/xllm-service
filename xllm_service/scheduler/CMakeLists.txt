@@ -35,6 +35,7 @@ cc_library(
     :common
     :etcd_client
     :loadbalance_policy
+    :kv_directory
     :managers
     :request
     cpprest

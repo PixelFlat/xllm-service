@@ -62,7 +62,7 @@ void XllmRpcClient::heartbeat() {
     brpc::Controller cntl;
     proto::HeartbeatRequest req;
     req.set_name(instance_name_);
-    // TODO: set req.cache_event and req.load_metrics
+    // TODO: set req.load_metrics
     proto::Status res;
     master_stub_->Heartbeat(&cntl, &req, &res, nullptr);
     if (cntl.Failed()) {

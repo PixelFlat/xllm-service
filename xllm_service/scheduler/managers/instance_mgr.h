@@ -38,6 +38,21 @@ limitations under the License.
 namespace xllm_service {
 class Scheduler;
 
+// A lightweight, consistent topology/load snapshot for routing.
+struct RoutingCandidate {
+  std::string name;
+  std::string incarnation_id;
+  uint64_t register_ts_ms = 0;
+  int32_t dp_size = 1;
+  InstanceType type = InstanceType::DEFAULT;
+  LoadMetrics load;
+};
+
+struct RoutingCandidates {
+  std::vector<RoutingCandidate> prefill;
+  std::vector<RoutingCandidate> decode;
+};
+
 class InstanceMgr final {
  public:
   explicit InstanceMgr(const Options& options,
@@ -49,6 +64,9 @@ class InstanceMgr final {
 
   InstanceMetaInfo get_instance_info(const std::string& instance_name);
 
+  // Local topology snapshot; no RPC or etcd access while reading it.
+  std::vector<InstanceMetaInfo> get_instance_snapshot() const;
+
   bool get_next_instance_pair(Routing* routing);
 
   std::vector<std::string> get_static_decode_list(
@@ -57,7 +75,7 @@ class InstanceMgr final {
   std::vector<std::string> get_static_prefill_list(
       const std::string& instance_name);
 
-  void get_load_metrics(LoadBalanceInfos* infos);
+  RoutingCandidates get_routing_candidates() const;
 
   std::shared_ptr<brpc::Channel> get_channel(const std::string& instance_name);
 
@@ -190,7 +208,7 @@ class InstanceMgr final {
       cached_channels_;
 
   // L2 — metrics & predictors (single lock to avoid order ambiguity)
-  std::shared_mutex metrics_mutex_;
+  mutable std::shared_mutex metrics_mutex_;
   std::unordered_map<std::string, LoadMetrics> load_metrics_;
   std::unordered_map<std::string, LoadMetrics> updated_metrics_;
   std::unordered_set<std::string> removed_instance_;

@@ -25,7 +25,6 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
-#include "common/hash_util.h"
 #include "nlohmann/json.hpp"
 
 namespace xllm_service {
@@ -33,12 +32,6 @@ namespace xllm_service {
 constexpr const char* ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
 constexpr const char* ETCD_XSERVICE_KEY_PREFIX = "XLLM:SERVICE:";
 constexpr const char* ETCD_MASTER_SERVICE_NAME = "MASTER";
-
-struct CacheLocations;
-using XXH3KeyCacheMap = std::unordered_map<XXH3Key,
-                                           CacheLocations,
-                                           FixedStringKeyHash,
-                                           FixedStringKeyEqual>;
 
 struct Routing {
   std::string prefill_name;
@@ -299,125 +292,6 @@ struct InstanceMetaInfo {
                             now.time_since_epoch())
                             .count();
     latest_timestamp = timestamp_ms;
-  }
-};
-
-struct CacheLocations {
-  std::unordered_set<std::string> hbm_instance_set;
-  std::unordered_set<std::string> dram_instance_set;
-  std::unordered_set<std::string> ssd_instance_set;
-
-  nlohmann::json serialize_to_json() const {
-    nlohmann::json json_val;
-    json_val["hbm_instance_set"] = hbm_instance_set;
-    json_val["dram_instance_set"] = dram_instance_set;
-    json_val["ssd_instance_set"] = ssd_instance_set;
-    return json_val;
-  }
-
-  std::string debug_string() { return serialize_to_json().dump(2); }
-
-  bool parse_from_json(const std::string& json_str) {
-    try {
-      nlohmann::json json_value = nlohmann::json::parse(json_str);
-      for (const auto& item :
-           json_value.at("hbm_instance_set").get<std::vector<std::string>>()) {
-        hbm_instance_set.insert(item);
-      }
-
-      for (const auto& item :
-           json_value.at("dram_instance_set").get<std::vector<std::string>>()) {
-        dram_instance_set.insert(item);
-      }
-
-      for (const auto& item :
-           json_value.at("ssd_instance_set").get<std::vector<std::string>>()) {
-        ssd_instance_set.insert(item);
-      }
-
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "json str:" << json_str
-                 << ", parse to cachelocation error: " << e.what();
-      return false;
-    }
-    return true;
-  }
-
-  bool empty() const {
-    return hbm_instance_set.empty() && dram_instance_set.empty() &&
-           ssd_instance_set.empty();
-  }
-};
-
-/**
- * @brief Records the prefix cache match lengths for different instances on
- * current request
- *
- * This struct stores and manages prefix cache matching information across
- * multiple instances, supporting different storage types (HBM, DRAM, SSD) for
- * match length recording, and tracks information about the best matching
- * instance.
- */
-struct OverlapScores {
-  // Set of matched instance names
-  std::unordered_set<std::string> instances;
-  // HBM storage type instance match length mapping (instance name -> match
-  // length)
-  std::unordered_map<std::string, uint32_t> hbm_instance_score;
-  // DRAM storage type instance match length mapping (instance name -> match
-  // length)
-  std::unordered_map<std::string, uint32_t> dram_instance_score;
-  // SSD storage type instance match length mapping (instance name -> match
-  // length)
-  std::unordered_map<std::string, uint32_t> ssd_instance_score;
-  uint32_t max_block_num = 0;
-  uint32_t max_matched_block_num = 0;
-  std::string max_matched_instance_name = "";
-
-  std::string debug_string() {
-    nlohmann::json json_val;
-    json_val["instances"] = instances;
-    json_val["hbm_instance_score"] = hbm_instance_score;
-    json_val["dram_instance_score"] = dram_instance_score;
-    json_val["ssd_instance_score"] = ssd_instance_score;
-    json_val["max_block_num"] = max_block_num;
-    json_val["max_matched_block_num"] = max_matched_block_num;
-    json_val["max_matched_instance_name"] = max_matched_instance_name;
-    return json_val.dump(2);
-  }
-};
-
-struct LoadBalanceInfos {
-  OverlapScores overlap_scores;
-  std::unordered_map<std::string, LoadMetrics> prefill_load_metrics;
-  std::unordered_map<std::string, LoadMetrics> decode_load_metrics;
-  uint64_t prefill_max_waiting_requests_num = 0;
-  uint64_t decode_max_waiting_requests_num = 0;
-
-  std::string debug_string() {
-    nlohmann::json json_val;
-
-    json_val["overlap_scores"] =
-        nlohmann::json::parse(overlap_scores.debug_string());
-
-    nlohmann::json prefill_json;
-    for (auto& [key, metrics] : prefill_load_metrics) {
-      prefill_json[key] = nlohmann::json::parse(metrics.debug_string());
-    }
-    json_val["prefill_load_metrics"] = prefill_json;
-
-    nlohmann::json decode_json;
-    for (auto& [key, metrics] : decode_load_metrics) {
-      decode_json[key] = nlohmann::json::parse(metrics.debug_string());
-    }
-    json_val["decode_load_metrics"] = decode_json;
-
-    json_val["prefill_max_waiting_requests_num"] =
-        prefill_max_waiting_requests_num;
-    json_val["decode_max_waiting_requests_num"] =
-        decode_max_waiting_requests_num;
-
-    return json_val.dump(2);
   }
 };
 

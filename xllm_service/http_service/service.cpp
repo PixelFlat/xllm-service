@@ -25,6 +25,7 @@ limitations under the License.
 #include <json2pb/pb_to_json.h>
 
 #include <functional>
+#include <limits>
 #include <nlohmann/json.hpp>
 
 #include "chat.pb.h"
@@ -856,7 +857,7 @@ void XllmHttpServiceImpl::Heartbeat(
 
   // Reuse the RPC heartbeat schema/path so HTTP sidecars and brpc
   // backends update scheduler state consistently: liveness/incarnation,
-  // LoadMetrics, and LatencyMetrics. vLLM cache_event is empty.
+  // LoadMetrics, and LatencyMetrics. Legacy cache_event is ignored.
   if (!scheduler_ || !scheduler_->handle_instance_heartbeat(&req)) {
     // Unknown instance or stale incarnation -> ask the sidecar to re-register.
     reply(409, "{\"error\":\"instance not registered or stale incarnation\"}");
@@ -864,6 +865,77 @@ void XllmHttpServiceImpl::Heartbeat(
   }
 
   reply(200, "{\"ok\":true}");
+}
+
+void XllmHttpServiceImpl::KVCacheQuery(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* /*request*/,
+    proto::HttpResponse* /*response*/,
+    ::google::protobuf::Closure* done) {
+  ClosureGuard done_guard(done);
+  auto* cntl = static_cast<brpc::Controller*>(controller);
+  const auto reply = [&](int32_t code, const nlohmann::json& body) {
+    cntl->http_response().set_status_code(code);
+    cntl->http_response().set_content_type("application/json");
+    cntl->response_attachment().append(body.dump());
+  };
+  if (!options_.internal_api_token().empty()) {
+    const std::string* token =
+        cntl->http_request().GetHeader("X-Internal-Token");
+    if (token == nullptr || *token != options_.internal_api_token()) {
+      reply(401, {{"error", "invalid internal token"}});
+      return;
+    }
+  }
+  const KVDirectory* directory =
+      scheduler_ == nullptr ? nullptr : scheduler_->kv_directory();
+  if (directory == nullptr) {
+    reply(404, {{"error", "KV events observation index is disabled"}});
+    return;
+  }
+  if (cntl->http_request().method() != brpc::HTTP_METHOD_POST) {
+    reply(405, {{"error", "POST required"}});
+    return;
+  }
+  if (cntl->request_attachment().size() > 1024 * 1024) {
+    reply(413, {{"error", "query body exceeds 1 MiB"}});
+    return;
+  }
+  const auto query = nlohmann::json::parse(
+      cntl->request_attachment().to_string(), nullptr, false);
+  if (!query.is_object() || !query.contains("token_ids") ||
+      !query["token_ids"].is_array() || query["token_ids"].size() > 131072) {
+    reply(400, {{"error", "expected token_ids array"}});
+    return;
+  }
+  std::vector<int32_t> tokens;
+  tokens.reserve(query["token_ids"].size());
+  for (const auto& value : query["token_ids"]) {
+    if (!value.is_number_integer() ||
+        (!value.is_number_unsigned() && value.get<int64_t>() < 0) ||
+        value.get<uint64_t>() >
+            static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+      reply(400, {{"error", "token IDs must be nonnegative int32 values"}});
+      return;
+    }
+    tokens.emplace_back(value.get<int32_t>());
+  }
+  const auto matches = directory->match(tokens);
+  nlohmann::json result = nlohmann::json::array();
+  for (const auto& match : matches) {
+    const auto& prefix = match.prefix;
+    result.push_back({{"instance_name", match.instance_name},
+                      {"dp_rank", match.dp_rank},
+                      {"synchronized", prefix.synchronized},
+                      {"sequence", prefix.sequence},
+                      {"device_hit_tokens", prefix.device_hit_tokens},
+                      {"host_only_hit_tokens", prefix.host_only_hit_tokens},
+                      {"reusable_prefix_tokens", prefix.reusable_prefix_tokens},
+                      {"device_blocks", prefix.device_blocks},
+                      {"host_blocks", prefix.host_blocks},
+                      {"error", prefix.error}});
+  }
+  reply(200, {{"matches", std::move(result)}});
 }
 
 }  // namespace xllm_service

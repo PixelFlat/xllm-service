@@ -57,8 +57,6 @@ DEFINE_string(
     "",
     "Optional etcd namespace prefix for all xllm-service keys, e.g. prod-a.");
 
-DEFINE_uint32(xxh3_128bits_seed, 1024, "default XXH3 128bits Hash seed");
-
 DEFINE_int32(port, 8888, "Port for xllm service to listen on");
 
 DEFINE_int32(num_threads, 32, "Number of threads to process requests");
@@ -92,6 +90,15 @@ DEFINE_string(load_balance_policy,
               "RR",
               "Disaggregated prefill-decode policy.");
 
+DEFINE_double(car_host_hit_weight,
+              0.5,
+              "CAR Host-only prefix benefit relative to Device, in [0, 1].");
+
+DEFINE_double(car_prefill_lambda,
+              0.5,
+              "CAR prefill cost: lambda * (1 - KV hit ratio) + "
+              "(1 - lambda) * normalized queue cost. Range [0, 1].");
+
 DEFINE_int32(detect_disconnected_instance_interval,
              15,
              "The interval that server detect the disconnected instance.");
@@ -116,6 +123,12 @@ DEFINE_int32(block_size,
              "Number of slots per kv cache block. Default is 128.");
 
 DEFINE_string(tokenizer_path, "", "tokenizer config path.");
+
+DEFINE_string(
+    kv_events_config_file,
+    "",
+    "JSON file of xLLM ZMQ KV discovery rules or static streams. Enables an "
+    "asynchronous Device/Host prefix index used by CAR and internal queries.");
 
 DEFINE_bool(enable_request_trace, false, "Whether to enable request trace");
 
