@@ -250,20 +250,22 @@ void handle_vllm_stream_done(brpc::Controller* redirect_cntl,
                              std::shared_ptr<T> call_data,
                              std::shared_ptr<brpc::Channel> channel,
                              std::shared_ptr<SessionLease> session_lease) {
-  if (redirect_cntl->Failed() ||
-      redirect_cntl->http_response().status_code() >= 400) {
-    if (session_lease != nullptr) {
-      session_lease->finish(/*failed=*/!call_data->is_disconnected());
-    }
+  const bool http_error = redirect_cntl->http_response().status_code() >= 400;
+  if (session_lease != nullptr && (redirect_cntl->Failed() || http_error)) {
+    session_lease->finish(/*failed=*/!call_data->is_disconnected());
+  }
+  if (redirect_cntl->Failed() && !http_error) {
     LOG(ERROR) << "Fail to forward to vLLM (stream): "
                << redirect_cntl->ErrorText();
     call_data->finish_with_error(redirect_cntl->ErrorText());
     delete redirect_cntl;
     return;
   }
-  if (session_lease != nullptr) {
+  if (session_lease != nullptr && !http_error) {
     session_lease->commit();
   }
+  // The downstream stream has already started. Relay HTTP error bodies too;
+  // invalidating affinity must not discard the backend's structured error.
   redirect_cntl->ReadProgressiveAttachmentBy(new CustomProgressiveReader<T>(
       redirect_cntl, call_data, std::move(session_lease)));
 }

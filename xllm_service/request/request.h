@@ -17,6 +17,9 @@ limitations under the License.
 
 #include <absl/time/time.h>
 
+#include <cstdint>
+#include <optional>
+
 #include "chat_template/jinja_chat_template.h"
 #include "common/call_data.h"
 #include "common/types.h"
@@ -68,6 +71,8 @@ struct Request {
   Routing routing;
   std::string prefill_incarnation_id;
   std::string decode_incarnation_id;
+  std::optional<uint64_t> prefill_register_ts_ms;
+  std::optional<uint64_t> decode_register_ts_ms;
 
   // prefill stage finished
   bool prefill_stage_finished = false;

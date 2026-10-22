@@ -16,9 +16,12 @@ limitations under the License.
 #include "scheduler/loadbalance_policy/session_aware_policy.h"
 
 #include <absl/time/clock.h>
+#include <brpc/closure_guard.h>
 #include <brpc/server.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <shared_mutex>
@@ -71,6 +74,13 @@ class SchedulerTestPeer final {
     return scheduler.publish_request(std::move(value));
   }
 
+  static void channel(InstanceMgr& manager,
+                      const std::string& name,
+                      std::shared_ptr<brpc::Channel> channel) {
+    std::unique_lock<std::shared_mutex> lock(manager.cluster_mutex_);
+    manager.cached_channels_.insert_or_assign(name, std::move(channel));
+  }
+
   static void drain(Scheduler& scheduler) {
     for (auto& pool : scheduler.output_threadpools_) {
       std::promise<void> done;
@@ -103,6 +113,21 @@ std::shared_ptr<Request> request(std::string session,
   result->model = std::move(model);
   return result;
 }
+
+class TestPlacement final : public LoadBalancePolicy {
+ public:
+  using Select = std::function<bool(std::shared_ptr<Request>)>;
+
+  TestPlacement(std::shared_ptr<InstanceMgr> manager, Select select)
+      : LoadBalancePolicy(std::move(manager)), select_(std::move(select)) {}
+
+  bool select_instances_pair(std::shared_ptr<Request> value) override {
+    return select_(std::move(value));
+  }
+
+ private:
+  Select select_;
+};
 
 class SessionAwarePolicyTest : public testing::Test {
  protected:
@@ -161,6 +186,18 @@ TEST_F(SessionAwarePolicyTest, IdentityFallbackAndModelIsolation) {
 }
 
 TEST_F(SessionAwarePolicyTest, ConcurrentInitialPlacement) {
+  RoundRobin fallback(manager_);
+  std::atomic<int32_t> selections{0};
+  policy_ = std::make_unique<SessionAwarePolicy>(
+      manager_,
+      std::make_unique<TestPlacement>(manager_,
+                                      [&](std::shared_ptr<Request> value) {
+                                        ++selections;
+                                        return fallback.select_instances_pair(
+                                            std::move(value));
+                                      }),
+      /*ttl_s=*/300,
+      /*max_entries=*/64);
   std::vector<std::future<std::shared_ptr<Request>>> pending;
   pending.reserve(8);
   for (int32_t i = 0; i < 8; ++i) {
@@ -172,13 +209,59 @@ TEST_F(SessionAwarePolicyTest, ConcurrentInitialPlacement) {
   for (auto& result : pending) {
     active.emplace_back(result.get());
     ASSERT_NE(active.back(), nullptr);
-    EXPECT_EQ(active.back()->routing.prefill_name, "A");
+    EXPECT_EQ(active.back()->routing.prefill_name,
+              active.front()->routing.prefill_name);
   }
   // No dispatch was confirmed: dropping the last hold must not commit a pin.
   active.clear();
+  const int32_t previous_selections = selections.load();
   auto retry = route("concurrent");
   ASSERT_NE(retry, nullptr);
-  EXPECT_EQ(retry->routing.prefill_name, "B");
+  EXPECT_EQ(selections.load(), previous_selections + 1);
+}
+
+TEST_F(SessionAwarePolicyTest, SlowPlacementAllowsConcurrentSessions) {
+  RoundRobin fallback(manager_);
+  std::atomic<bool> first{true};
+  std::promise<void> entered;
+  auto started = entered.get_future();
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  policy_ = std::make_unique<SessionAwarePolicy>(
+      manager_,
+      std::make_unique<TestPlacement>(manager_,
+                                      [&](std::shared_ptr<Request> value) {
+                                        if (first.exchange(false)) {
+                                          entered.set_value();
+                                          released.wait();
+                                        }
+                                        return fallback.select_instances_pair(
+                                            std::move(value));
+                                      }),
+      /*ttl_s=*/300,
+      /*max_entries=*/64);
+  auto slow = std::async(std::launch::async, [this] { return route("same"); });
+  const auto started_status = started.wait_for(std::chrono::seconds(5));
+  if (started_status != std::future_status::ready) {
+    release.set_value();
+    FAIL() << "Fallback placement did not start";
+  }
+  auto same = std::async(std::launch::async, [this] { return route("same"); });
+  auto other =
+      std::async(std::launch::async, [this] { return route("unrelated"); });
+  EXPECT_EQ(same.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  EXPECT_EQ(other.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  release.set_value();
+  auto first_request = slow.get();
+  auto same_session = same.get();
+  auto different_session = other.get();
+  ASSERT_NE(first_request, nullptr);
+  ASSERT_NE(same_session, nullptr);
+  ASSERT_NE(different_session, nullptr);
+  EXPECT_EQ(first_request->routing.prefill_name,
+            same_session->routing.prefill_name);
+  EXPECT_NE(first_request->routing.prefill_name,
+            different_session->routing.prefill_name);
 }
 
 TEST_F(SessionAwarePolicyTest, ActiveRequestsDelayExpiry) {
@@ -223,6 +306,35 @@ TEST_F(SessionAwarePolicyTest, ReplacementFencesOldCompletions) {
   auto after_error = route("restart");
   ASSERT_NE(after_error, nullptr);
   EXPECT_EQ(after_error->routing.prefill_name, "A");
+}
+
+TEST_F(SessionAwarePolicyTest, LegacyReplacementFencesRequests) {
+  auto p = instance("P", InstanceType::PREFILL, "");
+  auto d = instance("D", InstanceType::DECODE, "");
+  p.register_ts_ms = 0;
+  d.register_ts_ms = 0;
+  SchedulerTestPeer::instances(*manager_, {p, d});
+  auto scheduler = SchedulerTestPeer::scheduler(nullptr, manager_);
+  for (auto* changed : {&p, &d}) {
+    auto old = route("legacy");
+    ASSERT_NE(old, nullptr);
+    old->session_lease->commit();
+    EXPECT_EQ(old->prefill_register_ts_ms, p.register_ts_ms);
+    EXPECT_EQ(old->decode_register_ts_ms, d.register_ts_ms);
+    ++changed->register_ts_ms;
+    SchedulerTestPeer::instances(*manager_, {p, d});
+    EXPECT_FALSE(manager_->bind_request_instance_incarnations(old));
+    EXPECT_FALSE(manager_->request_instances_match(*old));
+    EXPECT_FALSE(SchedulerTestPeer::publish(*scheduler, old));
+    auto replacement = route("legacy");
+    ASSERT_NO_FATAL_FAILURE(complete(replacement));
+    old->session_lease->finish(/*failed=*/true);
+    auto repeated = route("legacy");
+    ASSERT_NE(repeated, nullptr);
+    EXPECT_EQ(repeated->prefill_register_ts_ms, p.register_ts_ms);
+    EXPECT_EQ(repeated->decode_register_ts_ms, d.register_ts_ms);
+    ASSERT_NO_FATAL_FAILURE(complete(repeated));
+  }
 }
 
 TEST_F(SessionAwarePolicyTest, PdFailoverRetainsHealthyPeer) {
@@ -359,6 +471,99 @@ class CaptureSessionPolicy final : public LoadBalancePolicy {
   mutable std::mutex mutex_;
   std::string observed_;
 };
+
+constexpr char kBackendError[] =
+    R"({"error":{"message":"backend rejected request","type":"backend_error"}})";
+
+class ErrorBackend final : public proto::XllmHttpService {
+ public:
+  void set_status(int32_t status) { status_.store(status); }
+
+  void Completions(google::protobuf::RpcController* controller,
+                   const proto::HttpRequest* /*request*/,
+                   proto::HttpResponse* /*response*/,
+                   google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    auto* http = static_cast<brpc::Controller*>(controller);
+    http->http_response().set_status_code(status_.load());
+    http->http_response().set_content_type("application/json");
+    http->response_attachment().append(kBackendError);
+  }
+
+ private:
+  std::atomic<int32_t> status_{400};
+};
+
+TEST_F(SessionAwarePolicyTest, StreamingHttpErrorsRetainBody) {
+  ErrorBackend backend;
+  brpc::Server backend_server;
+  ASSERT_EQ(backend_server.AddService(&backend,
+                                      brpc::SERVER_DOESNT_OWN_SERVICE,
+                                      "/v1/completions => Completions"),
+            0);
+  brpc::ServerOptions backend_options;
+  backend_options.num_threads = 2;
+  ASSERT_EQ(backend_server.Start("127.0.0.1:0", &backend_options), 0);
+  const std::string name =
+      butil::endpoint2str(backend_server.listen_address()).c_str();
+  auto info = instance(name);
+  info.backend_type = "vllm";
+  SchedulerTestPeer::instances(*manager_, {info});
+  brpc::ChannelOptions channel_options;
+  channel_options.protocol = "http";
+  channel_options.timeout_ms = 3000;
+  auto upstream = std::make_shared<brpc::Channel>();
+  ASSERT_EQ(upstream->Init(backend_server.listen_address(), &channel_options),
+            0);
+  SchedulerTestPeer::channel(*manager_, name, std::move(upstream));
+  RoundRobin fallback(manager_);
+  std::atomic<int32_t> selections{0};
+  policy_ = std::make_unique<SessionAwarePolicy>(
+      manager_,
+      std::make_unique<TestPlacement>(manager_,
+                                      [&](std::shared_ptr<Request> value) {
+                                        ++selections;
+                                        return fallback.select_instances_pair(
+                                            std::move(value));
+                                      }),
+      /*ttl_s=*/300,
+      /*max_entries=*/64);
+  auto scheduler = SchedulerTestPeer::scheduler(std::move(policy_), manager_);
+  Options options;
+  options.num_threads(1);
+  XllmHttpServiceImpl service(options, scheduler.get());
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service,
+                              brpc::SERVER_DOESNT_OWN_SERVICE,
+                              "/v1/completions => Completions"),
+            0);
+  brpc::ServerOptions server_options;
+  server_options.num_threads = 2;
+  ASSERT_EQ(server.Start("127.0.0.1:0", &server_options), 0);
+  brpc::Channel channel;
+  ASSERT_EQ(channel.Init(server.listen_address(), &channel_options), 0);
+  for (const int32_t status : {400, 503}) {
+    backend.set_status(status);
+    for (const std::string session : {"", "error-session"}) {
+      const int32_t before = selections.load();
+      for (int32_t repeat = 0; repeat < 2; ++repeat) {
+        brpc::Controller controller;
+        controller.http_request().uri() = "/v1/completions";
+        controller.http_request().set_method(brpc::HTTP_METHOD_POST);
+        controller.http_request().SetHeader("Content-Type", "application/json");
+        if (!session.empty()) {
+          controller.http_request().SetHeader("X-Session-ID", session);
+        }
+        controller.request_attachment().append(
+            R"({"model":"model","prompt":"hello","stream":true,"max_tokens":8})");
+        channel.CallMethod(nullptr, &controller, nullptr, nullptr, nullptr);
+        EXPECT_FALSE(controller.Failed()) << controller.ErrorText();
+        EXPECT_EQ(controller.response_attachment().to_string(), kBackendError);
+      }
+      EXPECT_EQ(selections.load(), before + 2);
+    }
+  }
+}
 
 TEST(SessionHeaderTest, ReadsCaseInsensitiveHeaderForAllInferenceEndpoints) {
   auto policy = std::make_unique<CaptureSessionPolicy>();

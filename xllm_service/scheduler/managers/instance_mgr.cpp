@@ -27,6 +27,7 @@ limitations under the License.
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -65,6 +66,14 @@ uint64_t current_time_ms() {
 bool is_instance_schedulable(const xllm_service::InstanceMetaInfo& info) {
   // LEASE_LOST instances can still be reused while heartbeats continue.
   return info.runtime_state != InstanceRuntimeState::SUSPECT;
+}
+
+bool matches_instance_identity(const xllm_service::InstanceMetaInfo& info,
+                               const std::string& incarnation_id,
+                               std::optional<uint64_t> register_ts_ms) {
+  return info.incarnation_id == incarnation_id &&
+         (!incarnation_id.empty() || (register_ts_ms.has_value() &&
+                                      info.register_ts_ms == *register_ts_ms));
 }
 
 bool select_next_schedulable_instance(
@@ -405,11 +414,15 @@ bool InstanceMgr::bind_request_instance_incarnations(
                  << runtime_state_name(prefill_it->second.runtime_state);
       return false;
     }
-    if (!request->prefill_incarnation_id.empty() &&
-        request->prefill_incarnation_id != prefill_it->second.incarnation_id) {
+    if ((!request->prefill_incarnation_id.empty() ||
+         request->prefill_register_ts_ms.has_value()) &&
+        !matches_instance_identity(prefill_it->second,
+                                   request->prefill_incarnation_id,
+                                   request->prefill_register_ts_ms)) {
       return false;
     }
     request->prefill_incarnation_id = prefill_it->second.incarnation_id;
+    request->prefill_register_ts_ms = prefill_it->second.register_ts_ms;
   }
 
   if (!request->routing.decode_name.empty()) {
@@ -425,11 +438,15 @@ bool InstanceMgr::bind_request_instance_incarnations(
                  << runtime_state_name(decode_it->second.runtime_state);
       return false;
     }
-    if (!request->decode_incarnation_id.empty() &&
-        request->decode_incarnation_id != decode_it->second.incarnation_id) {
+    if ((!request->decode_incarnation_id.empty() ||
+         request->decode_register_ts_ms.has_value()) &&
+        !matches_instance_identity(decode_it->second,
+                                   request->decode_incarnation_id,
+                                   request->decode_register_ts_ms)) {
       return false;
     }
     request->decode_incarnation_id = decode_it->second.incarnation_id;
+    request->decode_register_ts_ms = decode_it->second.register_ts_ms;
   }
 
   return true;
@@ -438,17 +455,22 @@ bool InstanceMgr::bind_request_instance_incarnations(
 bool InstanceMgr::request_instances_match(const Request& request) const {
   std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
   const auto matches = [this](const std::string& name,
-                              const std::string& incarnation_id) {
+                              const std::string& incarnation_id,
+                              std::optional<uint64_t> register_ts_ms) {
     if (name.empty()) {
       return true;
     }
     auto it = instances_.find(name);
     return it != instances_.end() && is_instance_schedulable(it->second) &&
-           it->second.incarnation_id == incarnation_id;
+           matches_instance_identity(
+               it->second, incarnation_id, register_ts_ms);
   };
   return matches(request.routing.prefill_name,
-                 request.prefill_incarnation_id) &&
-         matches(request.routing.decode_name, request.decode_incarnation_id);
+                 request.prefill_incarnation_id,
+                 request.prefill_register_ts_ms) &&
+         matches(request.routing.decode_name,
+                 request.decode_incarnation_id,
+                 request.decode_register_ts_ms);
 }
 
 bool InstanceMgr::record_instance_heartbeat(const std::string& instance_name,
@@ -852,16 +874,18 @@ void InstanceMgr::update_request_metrics(
   auto prefill_instance = instances_.find(request->routing.prefill_name);
   if (prefill_it != request_metrics_.end() &&
       prefill_instance != instances_.end() &&
-      prefill_instance->second.incarnation_id ==
-          request->prefill_incarnation_id) {
+      matches_instance_identity(prefill_instance->second,
+                                request->prefill_incarnation_id,
+                                request->prefill_register_ts_ms)) {
     apply_prefill_request_metrics(*request, action, prefill_it->second);
   }
   auto decode_it = request_metrics_.find(request->routing.decode_name);
   auto decode_instance = instances_.find(request->routing.decode_name);
   if (decode_it != request_metrics_.end() &&
       decode_instance != instances_.end() &&
-      decode_instance->second.incarnation_id ==
-          request->decode_incarnation_id) {
+      matches_instance_identity(decode_instance->second,
+                                request->decode_incarnation_id,
+                                request->decode_register_ts_ms)) {
     apply_decode_request_metrics(*request, action, decode_it->second);
     if (decode_it->second.decode_request_num == 0) {
       flip_decode_to_prefill(request->routing.decode_name);

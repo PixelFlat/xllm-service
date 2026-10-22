@@ -76,6 +76,10 @@ bool set_route(const std::shared_ptr<Request>& request,
   request->prefill_incarnation_id = prefill->incarnation_id;
   request->decode_incarnation_id =
       decode == nullptr ? "" : decode->incarnation_id;
+  request->prefill_register_ts_ms = prefill->register_ts_ms;
+  request->decode_register_ts_ms =
+      decode == nullptr ? std::nullopt
+                        : std::optional<uint64_t>(decode->register_ts_ms);
   return manager.bind_request_instance_incarnations(request);
 }
 
@@ -197,87 +201,90 @@ bool SessionAwarePolicy::select_instances_pair(
   key.append(request->model);
   key.append(session_id.data(), session_id.size());
 
-  // Tokenization is already complete; only local snapshots/selection occur
-  // under this lock. Provisional placement keeps concurrent first turns
-  // together.
-  std::lock_guard<std::mutex> lock(state_->mutex_);
-  state_->expire(state_->clock_());
-  auto found = state_->bindings_.find(key);
-  const Binding* previous =
-      found == state_->bindings_.end() ? nullptr : &found->second;
-  auto candidates =
-      instance_mgr_->get_routing_candidates(/*require_load=*/false);
-  const RoutingCandidate* prefill =
-      previous == nullptr
-          ? nullptr
-          : bound_candidate(candidates.prefill, previous->prefill);
-  const RoutingCandidate* decode =
-      previous == nullptr || !previous->decode
-          ? nullptr
-          : bound_candidate(candidates.decode, *previous->decode);
-  const bool complete =
-      prefill != nullptr &&
-      (decode != nullptr ||
-       (!previous->decode && prefill->type == InstanceType::DEFAULT));
-  if (!complete) {
-    if (!fallback_->select_instances_pair(request)) {
-      return false;
+  // Expensive fallback work (including CAR prefix lookup) runs without the
+  // session mutex. Re-read the binding afterward so concurrent initial turns
+  // adopt the first placement that acquired a lease.
+  bool placement_attempted = false;
+  std::optional<Routing> proposal;
+  for (;;) {
+    auto candidates =
+        instance_mgr_->get_routing_candidates(/*require_load=*/false);
+    std::unique_lock<std::mutex> lock(state_->mutex_);
+    state_->expire(state_->clock_());
+    auto found = state_->bindings_.find(key);
+    const Binding* previous =
+        found == state_->bindings_.end() ? nullptr : &found->second;
+    const RoutingCandidate* prefill =
+        previous == nullptr
+            ? nullptr
+            : bound_candidate(candidates.prefill, previous->prefill);
+    const RoutingCandidate* decode =
+        previous == nullptr || !previous->decode
+            ? nullptr
+            : bound_candidate(candidates.decode, *previous->decode);
+    const bool complete =
+        prefill != nullptr &&
+        (decode != nullptr ||
+         (!previous->decode && prefill->type == InstanceType::DEFAULT));
+    if (!complete && !placement_attempted) {
+      lock.unlock();
+      placement_attempted = true;
+      if (fallback_->select_instances_pair(request)) {
+        proposal = request->routing;
+      }
+      continue;
     }
-    candidates = instance_mgr_->get_routing_candidates(/*require_load=*/false);
-    prefill = previous == nullptr
-                  ? nullptr
-                  : bound_candidate(candidates.prefill, previous->prefill);
-    decode = previous == nullptr || !previous->decode
-                 ? nullptr
-                 : bound_candidate(candidates.decode, *previous->decode);
-    const auto* proposed_decode =
-        find_candidate(candidates.decode, request->routing.decode_name);
-    if (decode == nullptr) {
-      decode = proposed_decode;
-    }
-    if (prefill == nullptr ||
-        (decode == nullptr && prefill->type != InstanceType::DEFAULT)) {
-      prefill =
-          find_candidate(candidates.prefill, request->routing.prefill_name);
-    }
-  }
-  if (!set_route(request, *instance_mgr_, prefill, decode)) {
-    return false;
-  }
-
-  if (previous == nullptr) {
-    if (state_->bindings_.size() >= state_->max_entries_) {
-      if (state_->idle_.empty()) {
-        LOG(ERROR)
-            << "Session affinity capacity is occupied by active requests";
+    if (!complete) {
+      if (!proposal.has_value()) {
         return false;
       }
-      state_->erase(state_->idle_.front());
+      if (decode == nullptr) {
+        decode = find_candidate(candidates.decode, proposal->decode_name);
+      }
+      if (prefill == nullptr ||
+          (decode == nullptr && prefill->type != InstanceType::DEFAULT)) {
+        prefill = find_candidate(candidates.prefill, proposal->prefill_name);
+      }
     }
-    found = state_->bindings_.emplace(key, Binding{}).first;
+
+    if (!set_route(request, *instance_mgr_, prefill, decode)) {
+      return false;
+    }
+
+    if (previous == nullptr) {
+      if (state_->bindings_.size() >= state_->max_entries_) {
+        if (state_->idle_.empty()) {
+          LOG(ERROR)
+              << "Session affinity capacity is occupied by active requests";
+          return false;
+        }
+        state_->erase(state_->idle_.front());
+      }
+      found = state_->bindings_.emplace(key, Binding{}).first;
+    }
+    auto& binding = found->second;
+    if (binding.idle_position.has_value()) {
+      state_->idle_.erase(*binding.idle_position);
+      binding.idle_position.reset();
+    }
+    const bool unchanged =
+        same_instance(binding.prefill, *prefill) &&
+        binding.decode.has_value() == (decode != nullptr) &&
+        (decode == nullptr || same_instance(*binding.decode, *decode));
+    if (!unchanged) {
+      binding.prefill = *prefill;
+      binding.decode = decode == nullptr
+                           ? std::nullopt
+                           : std::optional<RoutingCandidate>(*decode);
+      binding.version = ++state_->next_version_;
+      binding.active = 0;
+      binding.committed = false;
+    }
+    ++binding.active;
+    request->session_lease = std::shared_ptr<SessionLease>(
+        new SessionLease(state_, std::move(key), binding.version));
+    return true;
   }
-  auto& binding = found->second;
-  if (binding.idle_position.has_value()) {
-    state_->idle_.erase(*binding.idle_position);
-    binding.idle_position.reset();
-  }
-  const bool unchanged =
-      same_instance(binding.prefill, *prefill) &&
-      binding.decode.has_value() == (decode != nullptr) &&
-      (decode == nullptr || same_instance(*binding.decode, *decode));
-  if (!unchanged) {
-    binding.prefill = *prefill;
-    binding.decode = decode == nullptr
-                         ? std::nullopt
-                         : std::optional<RoutingCandidate>(*decode);
-    binding.version = ++state_->next_version_;
-    binding.active = 0;
-    binding.committed = false;
-  }
-  ++binding.active;
-  request->session_lease = std::shared_ptr<SessionLease>(
-      new SessionLease(state_, std::move(key), binding.version));
-  return true;
 }
 
 }  // namespace xllm_service
