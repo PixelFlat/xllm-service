@@ -377,6 +377,9 @@ class KVDirectory::Stream final {
     size_t pending_bytes = 0;
     std::optional<KVEventBatch> snapshot;
     bool in_flight = false;
+    // Pre-request increments are covered by the upcoming snapshot and must not
+    // postpone its retry deadline while the index is unsynchronized.
+    bool awaiting_snapshot = true;
     bool subscription_connected = false;
     auto deadline = Clock::now();
     auto next_request = Clock::now();
@@ -388,6 +391,7 @@ class KVDirectory::Stream final {
       pending_bytes = 0;
       snapshot.reset();
       in_flight = false;
+      awaiting_snapshot = true;
       next_request = Clock::now() + std::chrono::milliseconds(200);
       return reset_replay();
     };
@@ -469,6 +473,7 @@ class KVDirectory::Stream final {
           pending_bytes = 0;
           snapshot.reset();
           in_flight = false;
+          awaiting_snapshot = false;
           next_request = Clock::now() +
                          std::chrono::milliseconds(config_.resync_interval_ms);
           if (!reset_replay()) {
@@ -491,7 +496,7 @@ class KVDirectory::Stream final {
             continue;
           }
           pending.emplace_back(std::move(batch));
-        } else if (!index_.apply(batch)) {
+        } else if (!awaiting_snapshot && !index_.apply(batch)) {
           if (!recover("live sequence gap or unresolved content")) {
             return;
           }
@@ -540,6 +545,7 @@ class KVDirectory::Stream final {
         pending_bytes = 0;
         snapshot.reset();
         in_flight = false;
+        awaiting_snapshot = false;
         next_request = Clock::now() +
                        std::chrono::milliseconds(config_.resync_interval_ms);
       }
