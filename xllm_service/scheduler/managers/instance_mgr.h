@@ -75,7 +75,7 @@ class InstanceMgr final {
   std::vector<std::string> get_static_prefill_list(
       const std::string& instance_name);
 
-  RoutingCandidates get_routing_candidates() const;
+  RoutingCandidates get_routing_candidates(bool require_load = true) const;
 
   std::shared_ptr<brpc::Channel> get_channel(const std::string& instance_name);
 

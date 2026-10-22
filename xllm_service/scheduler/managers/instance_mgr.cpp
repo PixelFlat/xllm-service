@@ -296,10 +296,11 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
   return prefill_list;
 }
 
-RoutingCandidates InstanceMgr::get_routing_candidates() const {
+RoutingCandidates InstanceMgr::get_routing_candidates(bool require_load) const {
   std::shared_lock<std::shared_mutex> inst_lock(cluster_mutex_);
   std::shared_lock<std::shared_mutex> metric_lock(metrics_mutex_);
-  const auto collect = [this](const std::vector<std::string>& index) {
+  const auto collect = [this,
+                        require_load](const std::vector<std::string>& index) {
     std::vector<RoutingCandidate> result;
     result.reserve(index.size());
     for (const auto& name : index) {
@@ -312,16 +313,18 @@ RoutingCandidates InstanceMgr::get_routing_candidates() const {
       // metrics. Instances without a first load report are not ready for CAR.
       const auto updated = updated_metrics_.find(name);
       const auto previous = load_metrics_.find(name);
-      if (updated == updated_metrics_.end() &&
-          previous == load_metrics_.end()) {
+      const LoadMetrics* reported =
+          updated != updated_metrics_.end() ? &updated->second
+          : previous != load_metrics_.end() ? &previous->second
+                                            : nullptr;
+      const bool valid_load = reported != nullptr &&
+                              std::isfinite(reported->gpu_cache_usage_perc) &&
+                              reported->gpu_cache_usage_perc >= 0 &&
+                              reported->gpu_cache_usage_perc <= 1;
+      if (require_load && !valid_load) {
         continue;
       }
-      const auto& load = updated != updated_metrics_.end() ? updated->second
-                                                           : previous->second;
-      if (!std::isfinite(load.gpu_cache_usage_perc) ||
-          load.gpu_cache_usage_perc < 0 || load.gpu_cache_usage_perc > 1) {
-        continue;
-      }
+      const LoadMetrics load = valid_load ? *reported : LoadMetrics{};
       const auto& info = instance->second;
       result.emplace_back(RoutingCandidate{name,
                                            info.incarnation_id,
@@ -387,8 +390,7 @@ bool InstanceMgr::bind_request_instance_incarnations(
   std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
 
   // Bind the selected routing to a concrete incarnation before dispatch.
-  request->prefill_incarnation_id.clear();
-  request->decode_incarnation_id.clear();
+  // A policy may already have bound a snapshot. Do not silently replace it.
 
   if (!request->routing.prefill_name.empty()) {
     auto prefill_it = instances_.find(request->routing.prefill_name);
@@ -401,6 +403,10 @@ bool InstanceMgr::bind_request_instance_incarnations(
       LOG(ERROR) << "Prefill instance is not schedulable when binding request: "
                  << request->routing.prefill_name << ", state: "
                  << runtime_state_name(prefill_it->second.runtime_state);
+      return false;
+    }
+    if (!request->prefill_incarnation_id.empty() &&
+        request->prefill_incarnation_id != prefill_it->second.incarnation_id) {
       return false;
     }
     request->prefill_incarnation_id = prefill_it->second.incarnation_id;
@@ -417,6 +423,10 @@ bool InstanceMgr::bind_request_instance_incarnations(
       LOG(ERROR) << "Decode instance is not schedulable when binding request: "
                  << request->routing.decode_name << ", state: "
                  << runtime_state_name(decode_it->second.runtime_state);
+      return false;
+    }
+    if (!request->decode_incarnation_id.empty() &&
+        request->decode_incarnation_id != decode_it->second.incarnation_id) {
       return false;
     }
     request->decode_incarnation_id = decode_it->second.incarnation_id;
