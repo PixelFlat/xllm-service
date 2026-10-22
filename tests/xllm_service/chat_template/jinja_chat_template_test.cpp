@@ -536,7 +536,7 @@ TEST(JinjaChatTemplate, DoesNotConflateLiteralDotsInPresencePaths) {
 
 TEST(JinjaChatTemplate, DoesNotTreatFilterNameAsContextPath) {
   const std::string template_str =
-      "{% if value | default is undefined %}missing"
+      "{% if value | string is undefined %}missing"
       "{% else %}defined{% endif %}";
 
   TokenizerArgs args;
@@ -551,7 +551,10 @@ TEST(JinjaChatTemplate, DoesNotTreatFilterNameAsContextPath) {
 
   auto result = template_.apply(messages, tools, kwargs);
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result.value(), "missing");
+  EXPECT_EQ(result.value(), "defined");
+  result = template_.apply(messages, tools, {{"value", "hello"}});
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result.value(), "defined");
 }
 
 TEST(JinjaChatTemplate, RejectsNonObjectChatTemplateKwargs) {
