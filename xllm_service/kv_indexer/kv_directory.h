@@ -25,6 +25,7 @@ limitations under the License.
 #include <thread>
 #include <vector>
 
+#include "cluster/instance_types.h"
 #include "kv_indexer/kv_index.h"
 
 namespace xllm_service {
@@ -47,6 +48,9 @@ struct KVEventInstance {
   uint64_t register_ts_ms = 0;
   int32_t dp_size = 1;
 };
+
+std::vector<KVEventInstance> make_kv_event_instances(
+    const std::vector<InstanceView>& instances);
 
 struct KVDiscoveryConfig {
   bool enabled = false;

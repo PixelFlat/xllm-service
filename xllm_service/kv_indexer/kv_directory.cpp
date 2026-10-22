@@ -740,4 +740,23 @@ std::vector<KVDirectoryMatch> KVDirectory::match(
   return result;
 }
 
+std::vector<KVEventInstance> make_kv_event_instances(
+    const std::vector<InstanceView>& instances) {
+  std::vector<KVEventInstance> result;
+  result.reserve(instances.size());
+  for (const auto& view : instances) {
+    const auto& info = *view.info;
+    if (info.backend_type != "xllm" ||
+        view.runtime_state == InstanceRuntimeState::SUSPECT ||
+        info.type == InstanceType::DECODE ||
+        (info.type == InstanceType::MIX &&
+         view.role != InstanceType::PREFILL)) {
+      continue;
+    }
+    result.emplace_back(KVEventInstance{
+        info.name, info.incarnation_id, info.register_ts_ms, info.dp_size});
+  }
+  return result;
+}
+
 }  // namespace xllm_service

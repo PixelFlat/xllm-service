@@ -35,68 +35,10 @@ limitations under the License.
 
 #include "http_service/service.h"
 #include "kv_indexer/kv_event_decoder.h"
-#include "scheduler/loadbalance_policy/cache_aware_routing.h"
-#include "scheduler/scheduler.h"
+#include "router/policies/cache_aware_routing.h"
+#include "tests/xllm_service/service_test_peer.h"
 
 namespace xllm_service {
-
-class SchedulerTestPeer final {
- public:
-  static std::unique_ptr<Scheduler> observing(KVDirectoryConfig config) {
-    auto scheduler = std::unique_ptr<Scheduler>(new Scheduler());
-    scheduler->instance_mgr_ = std::shared_ptr<InstanceMgr>(new InstanceMgr());
-    scheduler->kv_directory_ = std::make_unique<KVDirectory>(std::move(config));
-    scheduler->kv_directory_->start();
-    return scheduler;
-  }
-
-  static std::unique_ptr<Scheduler> discovering(KVDirectoryConfig config) {
-    auto scheduler = std::unique_ptr<Scheduler>(new Scheduler());
-    scheduler->instance_mgr_ = std::shared_ptr<InstanceMgr>(new InstanceMgr());
-    scheduler->kv_directory_ = std::make_unique<KVDirectory>(std::move(config));
-    scheduler->start_kv_event_discovery();
-    return scheduler;
-  }
-
-  static void instances(Scheduler& scheduler,
-                        std::vector<InstanceMetaInfo> values) {
-    auto& manager = *scheduler.instance_mgr_;
-    std::unique_lock<std::shared_mutex> lock(manager.cluster_mutex_);
-    manager.instances_.clear();
-    manager.prefill_index_.clear();
-    manager.decode_index_.clear();
-    for (auto& value : values) {
-      const std::string name = value.name;
-      const bool decode = value.type == InstanceType::DECODE ||
-                          (value.type == InstanceType::MIX &&
-                           value.current_type == InstanceType::DECODE);
-      (decode ? manager.decode_index_ : manager.prefill_index_)
-          .emplace_back(name);
-      manager.instances_.emplace(name, std::move(value));
-    }
-  }
-
-  static std::unique_ptr<CacheAwareRouting> routing(
-      Scheduler& scheduler,
-      bool use_directory = true,
-      double prefill_lambda = 0.5) {
-    return std::make_unique<CacheAwareRouting>(
-        scheduler.instance_mgr_,
-        use_directory ? scheduler.kv_directory() : nullptr,
-        /*host_hit_weight=*/0.5,
-        prefill_lambda);
-  }
-
-  static void load(Scheduler& scheduler,
-                   const std::string& name,
-                   uint64_t waiting,
-                   float usage) {
-    proto::LoadMetrics metrics;
-    metrics.set_waiting_requests_num(waiting);
-    metrics.set_gpu_cache_usage_perc(usage);
-    scheduler.instance_mgr_->record_load_metrics_update(name, metrics);
-  }
-};
 
 namespace {
 
@@ -565,9 +507,8 @@ TEST(KVDirectoryTest, DisconnectAndRestartDiscardOldResidency) {
 TEST(KVDirectoryTest, DiscoversEligibleRegisteredInstances) {
   Publisher publisher;
   publisher.state(10, {cleared(), stored(1, nullptr, {1, 2}, "cpu")});
-  auto scheduler =
-      SchedulerTestPeer::discovering(discovery_config_for(publisher));
-  auto& directory = *scheduler->kv_directory();
+  auto context = ServiceTestPeer::discovering(discovery_config_for(publisher));
+  auto& directory = *context->directory.get();
   EXPECT_TRUE(directory.match({}).empty());
   InstanceMetaInfo prefill = discovered_instance();
   InstanceMetaInfo decode = prefill;
@@ -577,7 +518,7 @@ TEST(KVDirectoryTest, DiscoversEligibleRegisteredInstances) {
   other_engine.name = "127.0.0.1:1002";
   other_engine.type = InstanceType::DEFAULT;
   other_engine.backend_type = "vllm";
-  SchedulerTestPeer::instances(*scheduler, {prefill, decode, other_engine});
+  ServiceTestPeer::instances(*context, {prefill, decode, other_engine});
   ASSERT_TRUE(eventually([&] {
     const auto matches = directory.match({1, 2});
     return matches.size() == 1 && matches[0].prefix.host_only_hit_tokens == 2;
@@ -587,38 +528,36 @@ TEST(KVDirectoryTest, DiscoversEligibleRegisteredInstances) {
   prefill.runtime_state = InstanceRuntimeState::LEASE_LOST;
   prefill.register_ts_ms = 2;  // same incarnation, not a new engine
   publisher.pause_replay_.store(true);
-  SchedulerTestPeer::instances(*scheduler, {prefill, decode});
+  ServiceTestPeer::instances(*context, {prefill, decode});
   std::this_thread::sleep_for(std::chrono::milliseconds(150));
   EXPECT_EQ(query(directory).host_only_hit_tokens, 2);
   prefill.runtime_state = InstanceRuntimeState::SUSPECT;
-  SchedulerTestPeer::instances(*scheduler, {prefill, decode});
+  ServiceTestPeer::instances(*context, {prefill, decode});
   ASSERT_TRUE(eventually([&] { return directory.match({}).empty(); }));
   prefill.runtime_state = InstanceRuntimeState::ACTIVE;
   prefill.type = InstanceType::DEFAULT;
   publisher.pause_replay_.store(false);
-  SchedulerTestPeer::instances(*scheduler, {prefill});
+  ServiceTestPeer::instances(*context, {prefill});
   ASSERT_TRUE(eventually([&] {
     const auto matches = directory.match({1, 2});
     return matches.size() == 1 && matches[0].prefix.host_only_hit_tokens == 2;
   }));
-  SchedulerTestPeer::instances(*scheduler, {});
+  ServiceTestPeer::instances(*context, {});
   ASSERT_TRUE(eventually([&] { return directory.match({}).empty(); }));
 }
 
 TEST(KVDirectoryTest, ReplacementDropsOldHitsBeforeSnapshotRecovery) {
   Publisher publisher;
   publisher.state(100, {cleared(), stored(1, nullptr, {1, 2})});
-  auto scheduler =
-      SchedulerTestPeer::discovering(discovery_config_for(publisher));
-  auto& directory = *scheduler->kv_directory();
-  SchedulerTestPeer::instances(*scheduler, {discovered_instance()});
+  auto context = ServiceTestPeer::discovering(discovery_config_for(publisher));
+  auto& directory = *context->directory.get();
+  ServiceTestPeer::instances(*context, {discovered_instance()});
   ASSERT_TRUE(eventually([&] {
     const auto matches = directory.match({1, 2});
     return matches.size() == 1 && matches[0].prefix.device_hit_tokens == 2;
   }));
   publisher.pause_replay_.store(true);
-  SchedulerTestPeer::instances(*scheduler,
-                               {discovered_instance("replacement")});
+  ServiceTestPeer::instances(*context, {discovered_instance("replacement")});
   ASSERT_TRUE(eventually([&] {
     const auto matches = directory.match({1, 2});
     return matches.size() == 1 && !matches[0].prefix.synchronized &&
@@ -640,11 +579,11 @@ TEST(KVDirectoryTest, DPChangesAndPortConflictsRetireOldStreams) {
   config.discovery.event_port_offset = 10000;
   config.discovery.replay_port_offset = 20000;
   config.max_streams = 3;
-  auto scheduler = SchedulerTestPeer::discovering(config);
-  auto& directory = *scheduler->kv_directory();
+  auto context = ServiceTestPeer::discovering(config);
+  auto& directory = *context->directory.get();
   InstanceMetaInfo first = discovered_instance();
   first.dp_size = 2;
-  SchedulerTestPeer::instances(*scheduler, {first});
+  ServiceTestPeer::instances(*context, {first});
   ASSERT_TRUE(eventually([&] {
     const auto matches = directory.match({});
     return matches.size() == 2 && matches[0].dp_rank == 0 &&
@@ -653,17 +592,17 @@ TEST(KVDirectoryTest, DPChangesAndPortConflictsRetireOldStreams) {
   InstanceMetaInfo conflicting = first;
   conflicting.name = "127.0.0.1:1001";
   conflicting.dp_size = 1;
-  SchedulerTestPeer::instances(*scheduler, {first, conflicting});
+  ServiceTestPeer::instances(*context, {first, conflicting});
   ASSERT_TRUE(eventually([&] { return directory.match({}).empty(); }));
   first.dp_size = 1;
-  SchedulerTestPeer::instances(*scheduler, {first});
+  ServiceTestPeer::instances(*context, {first});
   ASSERT_TRUE(eventually([&] { return directory.match({}).size() == 1; }));
   first.dp_size = 4;  // Do not retain an old, partially covered DP topology.
-  SchedulerTestPeer::instances(*scheduler, {first});
+  ServiceTestPeer::instances(*context, {first});
   ASSERT_TRUE(eventually([&] { return directory.match({}).empty(); }));
   first.dp_size = 1;
   first.name = "127.0.0.1:65535";
-  SchedulerTestPeer::instances(*scheduler, {first});
+  ServiceTestPeer::instances(*context, {first});
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   EXPECT_TRUE(directory.match({}).empty());
 }
@@ -737,33 +676,33 @@ std::shared_ptr<Request> routing_request() {
 
 TEST(CacheAwareRoutingTest, LoadAndTopologyWithoutIndex) {
   Publisher publisher;
-  auto scheduler = SchedulerTestPeer::observing(config_for(publisher));
-  auto policy = SchedulerTestPeer::routing(*scheduler, false);
+  auto context = ServiceTestPeer::observing(config_for(publisher));
+  auto policy = ServiceTestPeer::routing(*context, false);
   auto request = routing_request();
   auto first = routing_instance("P0");
   auto second = routing_instance("P1");
-  SchedulerTestPeer::instances(*scheduler, {first, second});
+  ServiceTestPeer::instances(*context, {first, second});
   EXPECT_FALSE(policy->select_instances_pair(request));  // no load reports
-  SchedulerTestPeer::load(*scheduler, "P0", 1, 0.6F);
-  SchedulerTestPeer::load(*scheduler, "P1", 2, 0.2F);
+  ServiceTestPeer::load(*context, "P0", 1, 0.6F);
+  ServiceTestPeer::load(*context, "P1", 2, 0.2F);
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");  // float queue penalty
   EXPECT_TRUE(request->routing.decode_name.empty());
-  SchedulerTestPeer::load(*scheduler, "P0", 2, 1.0F);
-  SchedulerTestPeer::load(*scheduler, "P1", 2, 1.0F);
+  ServiceTestPeer::load(*context, "P0", 2, 1.0F);
+  ServiceTestPeer::load(*context, "P1", 2, 1.0F);
   ASSERT_TRUE(policy->select_instances_pair(
       request));  // fully occupied candidates still route
   const std::string choice = request->routing.prefill_name;
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_NE(request->routing.prefill_name, choice);  // rotate equal scores
-  SchedulerTestPeer::load(
-      *scheduler, "P0", 0, std::numeric_limits<float>::quiet_NaN());
+  ServiceTestPeer::load(
+      *context, "P0", 0, std::numeric_limits<float>::quiet_NaN());
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");
 
   first.type = InstanceType::PREFILL;
   second.type = InstanceType::DECODE;
-  SchedulerTestPeer::instances(*scheduler, {first});
+  ServiceTestPeer::instances(*context, {first});
   EXPECT_FALSE(policy->select_instances_pair(request));  // no D
   EXPECT_TRUE(request->routing.prefill_name.empty());
   EXPECT_TRUE(request->routing.decode_name.empty());
@@ -771,22 +710,24 @@ TEST(CacheAwareRoutingTest, LoadAndTopologyWithoutIndex) {
   first.current_type = InstanceType::PREFILL;
   second.type = InstanceType::MIX;
   second.current_type = InstanceType::DECODE;
-  SchedulerTestPeer::instances(*scheduler, {first, second});
-  SchedulerTestPeer::load(*scheduler, "P0", 0, 0.1F);
+  ServiceTestPeer::instances(*context, {first, second});
+  // A re-added instance supplies a fresh load report.
+  ServiceTestPeer::load(*context, "P1", 2, 1.0F);
+  ServiceTestPeer::load(*context, "P0", 0, 0.1F);
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");
   EXPECT_EQ(request->routing.decode_name, "P1");
   auto third = routing_instance("D2", InstanceType::DECODE);
-  SchedulerTestPeer::instances(*scheduler, {first, second, third});
-  SchedulerTestPeer::load(*scheduler, "P1", 0, 0.8F);
-  SchedulerTestPeer::load(*scheduler, "D2", 0, 0.2F);
+  ServiceTestPeer::instances(*context, {first, second, third});
+  ServiceTestPeer::load(*context, "P1", 0, 0.8F);
+  ServiceTestPeer::load(*context, "D2", 0, 0.2F);
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.decode_name, "D2");
-  SchedulerTestPeer::load(*scheduler, "D2", 0, 1.0F);
+  ServiceTestPeer::load(*context, "D2", 0, 1.0F);
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.decode_name, "P1");
   second.runtime_state = InstanceRuntimeState::SUSPECT;
-  SchedulerTestPeer::instances(*scheduler, {first, second});
+  ServiceTestPeer::instances(*context, {first, second});
   EXPECT_FALSE(policy->select_instances_pair(request));
 }
 
@@ -794,15 +735,14 @@ TEST(CacheAwareRoutingTest, TierBenefitLoadAndLoss) {
   Publisher publisher;
   publisher.state(
       1, {cleared(), stored(11, nullptr, {1, 2}), stored(12, 11, {3, 4})});
-  auto scheduler = SchedulerTestPeer::observing(config_for(publisher));
-  ASSERT_TRUE(eventually([&] {
-    return query(*scheduler->kv_directory()).device_hit_tokens == 4;
-  }));
-  SchedulerTestPeer::instances(
-      *scheduler, {routing_instance("P0"), routing_instance("P1")});
-  SchedulerTestPeer::load(*scheduler, "P0", 0, 0.6F);
-  SchedulerTestPeer::load(*scheduler, "P1", 0, 0.2F);
-  auto policy = SchedulerTestPeer::routing(*scheduler);
+  auto context = ServiceTestPeer::observing(config_for(publisher));
+  ASSERT_TRUE(eventually(
+      [&] { return query(*context->directory.get()).device_hit_tokens == 4; }));
+  ServiceTestPeer::instances(*context,
+                             {routing_instance("P0"), routing_instance("P1")});
+  ServiceTestPeer::load(*context, "P0", 0, 0.6F);
+  ServiceTestPeer::load(*context, "P1", 0, 0.2F);
+  auto policy = ServiceTestPeer::routing(*context);
   auto request = routing_request();
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");  // Device benefit 1
@@ -813,30 +753,30 @@ TEST(CacheAwareRoutingTest, TierBenefitLoadAndLoss) {
                      removed(11, "gpu"),
                      removed(12, "gpu")});
   ASSERT_TRUE(eventually([&] {
-    return query(*scheduler->kv_directory()).host_only_hit_tokens == 4;
+    return query(*context->directory.get()).host_only_hit_tokens == 4;
   }));
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");  // Host benefit 0.5
-  SchedulerTestPeer::load(*scheduler, "P0", 0, 0.8F);
+  ServiceTestPeer::load(*context, "P0", 0, 0.8F);
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");  // usage is not a P cost
-  SchedulerTestPeer::load(*scheduler, "P0", 1, 0.8F);
+  ServiceTestPeer::load(*context, "P0", 1, 0.8F);
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");  // queue outweighs Host
-  auto cache_policy = SchedulerTestPeer::routing(*scheduler, true, 0.75);
+  auto cache_policy = ServiceTestPeer::routing(*context, true, 0.75);
   ASSERT_TRUE(cache_policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name,
             "P0");  // lambda changes the tradeoff
-  auto queue_only = SchedulerTestPeer::routing(*scheduler, true, 0.0);
+  auto queue_only = ServiceTestPeer::routing(*context, true, 0.0);
   ASSERT_TRUE(queue_only->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");
-  auto cache_only = SchedulerTestPeer::routing(*scheduler, true, 1.0);
+  auto cache_only = ServiceTestPeer::routing(*context, true, 1.0);
   ASSERT_TRUE(cache_only->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");
   publisher.pause_replay_.store(true);
   publisher.publish(4, {removed(11, "cpu")});  // skip sequence 3
   ASSERT_TRUE(eventually(
-      [&] { return !query(*scheduler->kv_directory()).synchronized; }));
+      [&] { return !query(*context->directory.get()).synchronized; }));
   ASSERT_TRUE(cache_policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");
 }
@@ -853,9 +793,9 @@ TEST(CacheAwareRoutingTest, RequiresEveryDPAndCurrentIncarnation) {
   source.dp_rank = 1;
   source.incarnation_id = "old";
   config.sources.emplace_back(std::move(source));
-  auto scheduler = SchedulerTestPeer::observing(std::move(config));
+  auto context = ServiceTestPeer::observing(std::move(config));
   ASSERT_TRUE(eventually([&] {
-    const auto matches = scheduler->kv_directory()->match({1, 2, 3, 4});
+    const auto matches = context->directory.get()->match({1, 2, 3, 4});
     return matches.size() == 2 && matches[0].prefix.synchronized &&
            matches[1].prefix.synchronized;
   }));
@@ -864,29 +804,29 @@ TEST(CacheAwareRoutingTest, RequiresEveryDPAndCurrentIncarnation) {
   first.dp_size = 2;
   auto second = routing_instance("P1");
   auto third = routing_instance("P2");
-  SchedulerTestPeer::instances(*scheduler, {first, second, third});
-  SchedulerTestPeer::load(*scheduler, "P0", 1, 0.4F);
-  SchedulerTestPeer::load(*scheduler, "P1", 0, 0.1F);
-  SchedulerTestPeer::load(*scheduler, "P2", 3, 0.1F);
-  auto policy = SchedulerTestPeer::routing(*scheduler);
+  ServiceTestPeer::instances(*context, {first, second, third});
+  ServiceTestPeer::load(*context, "P0", 1, 0.4F);
+  ServiceTestPeer::load(*context, "P1", 0, 0.1F);
+  ServiceTestPeer::load(*context, "P2", 3, 0.1F);
+  auto policy = ServiceTestPeer::routing(*context);
   auto request = routing_request();
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");  // min(1, 0.25), not sum/max
   rank1.publish(2, {stored(22, 21, {3, 4}, "cpu")});
   ASSERT_TRUE(eventually([&] {
-    return scheduler->kv_directory()
+    return context->directory.get()
                ->match(request->token_ids)[1]
                .prefix.host_only_hit_tokens == 4;
   }));
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P0");  // min(1, 0.5)
   first.dp_size = 3;  // third DP not discovered/synchronized yet
-  SchedulerTestPeer::instances(*scheduler, {first, second, third});
+  ServiceTestPeer::instances(*context, {first, second, third});
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");
   first.dp_size = 2;
   first.incarnation_id = "new";  // same address, stale directory before refresh
-  SchedulerTestPeer::instances(*scheduler, {first, second, third});
+  ServiceTestPeer::instances(*context, {first, second, third});
   ASSERT_TRUE(policy->select_instances_pair(request));
   EXPECT_EQ(request->routing.prefill_name, "P1");
 }
@@ -894,12 +834,18 @@ TEST(CacheAwareRoutingTest, RequiresEveryDPAndCurrentIncarnation) {
 TEST(KVCacheQueryTest, ReturnsTierMatchesAndValidatesInternalRequests) {
   Publisher publisher;
   publisher.state(1, {cleared(), stored(1, nullptr, {1, 2}, "cpu")});
-  auto scheduler = SchedulerTestPeer::observing(config_for(publisher));
+  auto context = ServiceTestPeer::observing(config_for(publisher));
   ASSERT_TRUE(eventually(
-      [&] { return query(*scheduler->kv_directory()).synchronized; }));
-  Options options;
+      [&] { return query(*context->directory.get()).synchronized; }));
+  ServiceConfig options;
   options.num_threads(1).internal_api_token("test-only");
-  XllmHttpServiceImpl service(options, scheduler.get());
+  XllmHttpServiceImpl service(options,
+                              nullptr,
+                              context->requests.get(),
+                              context->instances.get(),
+                              context->controller.get(),
+                              context->directory.get(),
+                              context->client.get());
   brpc::Server server;
   ASSERT_EQ(server.AddService(&service,
                               brpc::SERVER_DOESNT_OWN_SERVICE,

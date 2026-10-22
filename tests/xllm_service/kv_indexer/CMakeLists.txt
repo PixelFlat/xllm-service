@@ -7,7 +7,9 @@ cc_test(
     kv_directory_test.cpp
   DEPS
     :kv_directory
-    :loadbalance_policy
+    :routing_policies
+    :instance_controller
+    :request_manager
     :xllm_http_service
     GTest::gtest_main
 )

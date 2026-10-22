@@ -12,6 +12,7 @@ cc_library(
     kv_index.cpp
     kv_event_decoder.cpp
   DEPS
+    :common
     glog::glog
     nlohmann_json::nlohmann_json
     xxHash
