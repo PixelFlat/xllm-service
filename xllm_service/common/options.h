@@ -71,9 +71,13 @@ class Options {
   // scheduler options
   PROPERTY(std::string, load_balance_policy);
 
+  PROPERTY(double, car_host_hit_weight) = 0.5;
+
+  PROPERTY(double, car_prefill_lambda) = 0.5;
+
   PROPERTY(int32_t, block_size) = 128;
 
-  PROPERTY(uint32_t, xxh3_128bits_seed) = 1024;
+  PROPERTY(std::string, kv_events_config_file);
 
   PROPERTY(std::string, service_name);
 

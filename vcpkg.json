@@ -102,7 +102,8 @@
       "name": "re2",
       "version>=": "2023-07-01",
       "default-features": false
-    }
+    },
+    "zeromq"
   ],
   "builtin-baseline": "fba75d09065fcc76a25dcf386b1d00d33f5175af"
 }

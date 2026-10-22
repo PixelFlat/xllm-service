@@ -75,7 +75,9 @@ bool Master::setup_http_server() {
                               "/v1/embeddings => Embeddings,"
                               "/v1/models => Models,"
                               "/metrics => Metrics,"
-                              "/v1/internal/heartbeat => Heartbeat,") != 0) {
+                              "/v1/internal/heartbeat => Heartbeat,"
+                              "/v1/internal/kv-cache/query => KVCacheQuery,") !=
+      0) {
     LOG(FATAL) << "Fail to add http service";
     return false;
   }
@@ -223,7 +225,8 @@ int main(int argc, char* argv[]) {
       .etcd_addr(FLAGS_etcd_addr)
       .etcd_namespace(FLAGS_etcd_namespace)
       .load_balance_policy(FLAGS_load_balance_policy)
-      .xxh3_128bits_seed(FLAGS_xxh3_128bits_seed)
+      .car_host_hit_weight(FLAGS_car_host_hit_weight)
+      .car_prefill_lambda(FLAGS_car_prefill_lambda)
       .service_name(xllm_service::utils::get_local_ip() + ":" +
                     std::to_string(FLAGS_rpc_server_port))
       .detect_disconnected_instance_interval(
@@ -233,6 +236,7 @@ int main(int argc, char* argv[]) {
       .lease_lost_heartbeat_timeout_ms(FLAGS_lease_lost_heartbeat_timeout_ms)
       .enable_request_trace(FLAGS_enable_request_trace)
       .block_size(FLAGS_block_size)
+      .kv_events_config_file(FLAGS_kv_events_config_file)
       .tokenizer_path(FLAGS_tokenizer_path)
       .default_backend_type(FLAGS_default_backend_type)
       .vllm_http_timeout_ms(FLAGS_vllm_http_timeout_ms)

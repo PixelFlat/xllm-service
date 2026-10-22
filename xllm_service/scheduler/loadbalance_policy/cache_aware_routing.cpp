@@ -15,73 +15,168 @@ limitations under the License.
 
 #include "cache_aware_routing.h"
 
-namespace xllm_service {
+#include <glog/logging.h>
 
-constexpr float MIN_SCORE = -2.0;
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <unordered_map>
+#include <utility>
+
+namespace xllm_service {
+namespace {
+
+struct InstanceAffinity {
+  int32_t matched_ranks = 0;
+  double minimum = 1.0;
+};
+
+// The engine chooses the local DP: the current service routing protocol cannot
+// pin it. Only credit benefit present on every DP of this exact incarnation.
+std::unordered_map<std::string, double> prefix_benefits(
+    const std::vector<RoutingCandidate>& candidates,
+    const std::vector<KVDirectoryMatch>& matches,
+    size_t prompt_tokens,
+    double host_hit_weight) {
+  std::unordered_map<std::string, const RoutingCandidate*> by_name;
+  by_name.reserve(candidates.size());
+  for (const auto& candidate : candidates) {
+    by_name.emplace(candidate.name, &candidate);
+  }
+  std::unordered_map<std::string, InstanceAffinity> affinities;
+  affinities.reserve(candidates.size());
+  for (const auto& match : matches) {
+    const auto candidate_it = by_name.find(match.instance_name);
+    if (candidate_it == by_name.end() || !match.prefix.synchronized) {
+      continue;
+    }
+    const auto& candidate = *candidate_it->second;
+    if (match.dp_rank < 0 || match.dp_rank >= candidate.dp_size ||
+        match.incarnation_id != candidate.incarnation_id ||
+        (candidate.incarnation_id.empty() &&
+         match.register_ts_ms != candidate.register_ts_ms)) {
+      continue;
+    }
+    const double benefit =
+        std::clamp((static_cast<double>(match.prefix.device_hit_tokens) +
+                    host_hit_weight * match.prefix.host_only_hit_tokens) /
+                       static_cast<double>(prompt_tokens),
+                   0.0,
+                   1.0);
+    auto& affinity = affinities[candidate.name];
+    ++affinity.matched_ranks;
+    affinity.minimum = std::min(affinity.minimum, benefit);
+  }
+  std::unordered_map<std::string, double> result;
+  result.reserve(affinities.size());
+  for (const auto& candidate : candidates) {
+    const auto found = affinities.find(candidate.name);
+    if (found != affinities.end() && candidate.dp_size > 0 &&
+        found->second.matched_ranks == candidate.dp_size) {
+      result.emplace(candidate.name, found->second.minimum);
+    }
+  }
+  return result;
+}
+
+template <typename Cost>
+std::string select_candidate(const std::vector<RoutingCandidate>& candidates,
+                             uint64_t rotation,
+                             Cost cost) {
+  if (candidates.empty()) {
+    return {};
+  }
+  uint64_t max_waiting = 0;
+  for (const auto& candidate : candidates) {
+    max_waiting = std::max(max_waiting, candidate.load.waiting_requests_num);
+  }
+  double best_score = std::numeric_limits<double>::infinity();
+  std::string best;
+  const size_t start = rotation % candidates.size();
+  for (size_t offset = 0; offset < candidates.size(); ++offset) {
+    const auto& candidate = candidates[(start + offset) % candidates.size()];
+    const double queue_cost =
+        max_waiting == 0
+            ? 0.0
+            : static_cast<double>(candidate.load.waiting_requests_num) /
+                  static_cast<double>(max_waiting);
+    const double score = cost(candidate, queue_cost);
+    if (score < best_score) {
+      best_score = score;
+      best = candidate.name;
+    }
+  }
+  return best;
+}
+
+}  // namespace
+
+CacheAwareRouting::CacheAwareRouting(std::shared_ptr<InstanceMgr> instance_mgr,
+                                     const KVDirectory* directory,
+                                     double host_hit_weight,
+                                     double prefill_lambda)
+    : LoadBalancePolicy(std::move(instance_mgr)),
+      directory_(directory),
+      host_hit_weight_(host_hit_weight),
+      prefill_lambda_(prefill_lambda) {
+  CHECK(std::isfinite(host_hit_weight_) && host_hit_weight_ >= 0.0 &&
+        host_hit_weight_ <= 1.0)
+      << "car_host_hit_weight must be in [0, 1]";
+  CHECK(std::isfinite(prefill_lambda_) && prefill_lambda_ >= 0.0 &&
+        prefill_lambda_ <= 1.0)
+      << "car_prefill_lambda must be in [0, 1]";
+  if (directory_ == nullptr) {
+    LOG(WARNING)
+        << "CAR has no KV event directory; prefill hit ratios are zero";
+  }
+}
 
 bool CacheAwareRouting::select_instances_pair(
     std::shared_ptr<Request> request) {
-  LoadBalanceInfos lb_infos;
-  if (!request->token_ids.empty()) {
-    Slice<int32_t> token_ids(request->token_ids.data(),
-                             request->token_ids.size());
-    global_kvcache_mgr_->match(token_ids, &lb_infos.overlap_scores);
-    DLOG(INFO) << lb_infos.debug_string();
+  request->routing = {};
+  auto candidates = instance_mgr_->get_routing_candidates();
+  if (candidates.decode.empty()) {
+    // A lone PREFILL cannot generate a response. DEFAULT serves end to end.
+    auto& prefill = candidates.prefill;
+    prefill.erase(std::remove_if(prefill.begin(),
+                                 prefill.end(),
+                                 [](const RoutingCandidate& candidate) {
+                                   return candidate.type !=
+                                          InstanceType::DEFAULT;
+                                 }),
+                  prefill.end());
   }
-
-  instance_mgr_->get_load_metrics(&lb_infos);
-  DLOG(INFO) << lb_infos.debug_string();
-
-  if (lb_infos.prefill_load_metrics.size() == 0) {
-    LOG(INFO) << "No node available!";
+  if (candidates.prefill.empty()) {
     return false;
   }
-
-  // find preifll
-  cost_function(lb_infos.overlap_scores.hbm_instance_score,
-                lb_infos.overlap_scores.max_block_num,
-                lb_infos.prefill_load_metrics,
-                lb_infos.prefill_max_waiting_requests_num,
-                &request->routing.prefill_name);
-
-  // find decode
-  if (lb_infos.decode_load_metrics.size()) {
-    cost_function(lb_infos.overlap_scores.hbm_instance_score,
-                  lb_infos.overlap_scores.max_block_num,
-                  lb_infos.decode_load_metrics,
-                  lb_infos.decode_max_waiting_requests_num,
-                  &request->routing.decode_name);
+  std::unordered_map<std::string, double> benefits;
+  if (directory_ != nullptr && !request->token_ids.empty()) {
+    benefits = prefix_benefits(candidates.prefill,
+                               directory_->match(request->token_ids),
+                               request->token_ids.size(),
+                               host_hit_weight_);
   }
-
+  const uint64_t rotation =
+      next_selection_.fetch_add(1, std::memory_order_relaxed);
+  request->routing.prefill_name = select_candidate(
+      candidates.prefill,
+      rotation,
+      [this, &benefits](const RoutingCandidate& candidate, double queue_cost) {
+        const auto found = benefits.find(candidate.name);
+        const double kv_hit_ratio =
+            found == benefits.end() ? 0.0 : found->second;
+        return prefill_lambda_ * (1.0 - kv_hit_ratio) +
+               (1.0 - prefill_lambda_) * queue_cost;
+      });
+  // Decode-side reserved blocks are not a reusable prefill prefix. Minimizing
+  // this cost preserves the original decode load ordering.
+  request->routing.decode_name = select_candidate(
+      candidates.decode,
+      rotation,
+      [](const RoutingCandidate& candidate, double queue_cost) {
+        return candidate.load.gpu_cache_usage_perc + queue_cost;
+      });
   return true;
-}
-
-void CacheAwareRouting::cost_function(
-    const std::unordered_map<std::string, uint32_t>& overlap_scores,
-    const uint32_t& max_block_num,
-    const std::unordered_map<std::string, LoadMetrics>& load_metrics,
-    const int64_t& max_waiting_requests_num,
-    std::string* best_choice) {
-  float best_score = MIN_SCORE;
-  for (const auto& it : load_metrics) {
-    const auto matched_blocks_it = overlap_scores.find(it.first);
-    uint32_t matched_blocks = 0;
-    if (matched_blocks_it != overlap_scores.end()) {
-      matched_blocks = matched_blocks_it->second;
-    }
-
-    auto score =
-        (max_block_num == 0 ? 0 : matched_blocks / max_block_num) -
-        it.second.gpu_cache_usage_perc -
-        (max_waiting_requests_num == 0
-             ? 0
-             : it.second.waiting_requests_num / max_waiting_requests_num);
-
-    if (score > best_score) {
-      best_score = score;
-      *best_choice = it.first;
-    }
-  }
 }
 
 }  // namespace xllm_service

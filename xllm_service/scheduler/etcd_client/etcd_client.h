@@ -22,7 +22,6 @@ limitations under the License.
 #include <string>
 #include <unordered_set>
 
-#include "common/hash_util.h"
 #include "common/types.h"
 
 namespace xllm_service {
@@ -74,8 +73,6 @@ class EtcdClient {
     }
     return rt;
   }
-
-  bool set(const std::string& key_prefix, const XXH3KeyCacheMap& values);
 
   bool set(const std::string& key, const std::string& value);
 
@@ -130,8 +127,6 @@ class EtcdClient {
     }
     return true;
   }
-
-  bool get_prefix(const std::string& key_prefix, XXH3KeyCacheMap* values);
 
   bool get_prefix(const std::string& key_prefix,
                   std::unordered_map<std::string, std::string>* values);

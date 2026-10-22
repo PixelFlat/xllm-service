@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -146,6 +147,16 @@ InstanceMgr::InstanceMgr(const Options& options,
 
   state_reconcile_thread_ = std::make_unique<std::thread>(
       &InstanceMgr::reconcile_instance_states, this);
+}
+
+std::vector<InstanceMetaInfo> InstanceMgr::get_instance_snapshot() const {
+  std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
+  std::vector<InstanceMetaInfo> result;
+  result.reserve(instances_.size());
+  for (const auto& entry : instances_) {
+    result.emplace_back(entry.second);
+  }
+  return result;
 }
 
 void InstanceMgr::init() {
@@ -285,78 +296,43 @@ std::vector<std::string> InstanceMgr::get_static_prefill_list(
   return prefill_list;
 }
 
-void InstanceMgr::get_load_metrics(LoadBalanceInfos* infos) {
+RoutingCandidates InstanceMgr::get_routing_candidates() const {
   std::shared_lock<std::shared_mutex> inst_lock(cluster_mutex_);
   std::shared_lock<std::shared_mutex> metric_lock(metrics_mutex_);
-
-  for (auto name : infos->overlap_scores.instances) {
-    auto it = load_metrics_.find(name);
-    if (it == load_metrics_.end()) {
-      continue;
-    }
-    auto instance_it = instances_.find(name);
-    if (instance_it == instances_.end() ||
-        !is_instance_schedulable(instance_it->second)) {
-      continue;
-    }
-
-    if (instance_it->second.type == InstanceType::DECODE) {
-      infos->decode_load_metrics.insert(std::make_pair(name, it->second));
-      infos->decode_max_waiting_requests_num =
-          std::max(infos->decode_max_waiting_requests_num,
-                   it->second.waiting_requests_num);
-    } else {
-      infos->prefill_load_metrics.insert(std::make_pair(name, it->second));
-      infos->prefill_max_waiting_requests_num =
-          std::max(infos->prefill_max_waiting_requests_num,
-                   it->second.waiting_requests_num);
-    }
-  }
-
-  std::string least_loaded_prefill_instance;
-  float least_loaded_prefill_gpu_cache_usage_perc = 1;
-  std::string least_loaded_decode_instance;
-  float least_loaded_decode_gpu_cache_usage_perc = 1;
-
-  if (infos->prefill_load_metrics.size() == 0 ||
-      infos->decode_load_metrics.size() == 0) {
-    for (const auto& metric : load_metrics_) {
-      auto instance_it = instances_.find(metric.first);
-      if (instance_it == instances_.end() ||
-          !is_instance_schedulable(instance_it->second)) {
+  const auto collect = [this](const std::vector<std::string>& index) {
+    std::vector<RoutingCandidate> result;
+    result.reserve(index.size());
+    for (const auto& name : index) {
+      const auto instance = instances_.find(name);
+      if (instance == instances_.end() ||
+          !is_instance_schedulable(instance->second)) {
         continue;
       }
-      if (instance_it->second.type != InstanceType::DECODE) {
-        if (metric.second.gpu_cache_usage_perc <
-            least_loaded_prefill_gpu_cache_usage_perc) {
-          least_loaded_prefill_gpu_cache_usage_perc =
-              metric.second.gpu_cache_usage_perc;
-          least_loaded_prefill_instance = metric.first;
-        }
-      } else {
-        if (metric.second.gpu_cache_usage_perc <
-            least_loaded_decode_gpu_cache_usage_perc) {
-          least_loaded_decode_gpu_cache_usage_perc =
-              metric.second.gpu_cache_usage_perc;
-          least_loaded_decode_instance = metric.first;
-        }
+      // Prefer this master's latest heartbeat over the periodically replicated
+      // metrics. Instances without a first load report are not ready for CAR.
+      const auto updated = updated_metrics_.find(name);
+      const auto previous = load_metrics_.find(name);
+      if (updated == updated_metrics_.end() &&
+          previous == load_metrics_.end()) {
+        continue;
       }
+      const auto& load = updated != updated_metrics_.end() ? updated->second
+                                                           : previous->second;
+      if (!std::isfinite(load.gpu_cache_usage_perc) ||
+          load.gpu_cache_usage_perc < 0 || load.gpu_cache_usage_perc > 1) {
+        continue;
+      }
+      const auto& info = instance->second;
+      result.emplace_back(RoutingCandidate{name,
+                                           info.incarnation_id,
+                                           info.register_ts_ms,
+                                           info.dp_size,
+                                           info.type,
+                                           load});
     }
-  }
-
-  if (infos->prefill_load_metrics.size() == 0 &&
-      !least_loaded_prefill_instance.empty()) {
-    infos->prefill_load_metrics.insert(
-        std::make_pair(least_loaded_prefill_instance,
-                       load_metrics_[least_loaded_prefill_instance]));
-  }
-
-  if (infos->decode_load_metrics.size() == 0 &&
-      !least_loaded_decode_instance.empty()) {
-    infos->decode_load_metrics.insert(
-        std::make_pair(least_loaded_decode_instance,
-                       load_metrics_[least_loaded_decode_instance]));
-  }
+    return result;
+  };
+  return {collect(prefill_index_), collect(decode_index_)};
 }
 
 void InstanceMgr::record_load_metrics_update(

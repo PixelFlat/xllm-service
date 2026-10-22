@@ -44,4 +44,6 @@ service XllmHttpService {
   // Internal: backends (e.g. the vLLM sidecar) POST a heartbeat carrying
   // LoadMetrics/LatencyMetrics here. Body is JSON of proto HeartbeatRequest.
   rpc Heartbeat (HttpRequest) returns (HttpResponse) {}
+  // Internal, read-only query of the optional ZMQ observation index.
+  rpc KVCacheQuery (HttpRequest) returns (HttpResponse) {}
 }

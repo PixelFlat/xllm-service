@@ -139,6 +139,7 @@ find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(ZeroMQ CONFIG REQUIRED)
 
 if (USE_CXX11_ABI)
   # only use jemalloc if using the new C++-11 ABI

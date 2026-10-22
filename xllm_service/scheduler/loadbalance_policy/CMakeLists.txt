@@ -18,4 +18,5 @@ cc_library(
     :chat_template
     :common
     :managers
+    :kv_directory
 )

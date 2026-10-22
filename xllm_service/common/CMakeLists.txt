@@ -16,7 +16,6 @@ cc_library(
     time_predictor.h
     types.h
     utils.h
-    hash_util.h
     timer.h
     metrics.h
     xllm/output.h
@@ -30,7 +29,6 @@ cc_library(
     threadpool.cpp
     time_predictor.cpp
     utils.cpp
-    hash_util.cpp
     timer.cpp
     metrics.cpp
     xllm/uuid.cpp

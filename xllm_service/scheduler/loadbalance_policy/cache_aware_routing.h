@@ -15,34 +15,30 @@ limitations under the License.
 
 #pragma once
 
-#include "common/macros.h"
+#include <atomic>
+#include <memory>
+
+#include "kv_indexer/kv_directory.h"
 #include "loadbalance_policy.h"
-#include "scheduler/managers/global_kvcache_mgr.h"
 
 namespace xllm_service {
 
 class CacheAwareRouting final : public LoadBalancePolicy {
  public:
+  // Scheduler owns the directory and outlives this policy. nullptr explicitly
+  // sets hit ratios to zero when event subscriptions are disabled.
   CacheAwareRouting(std::shared_ptr<InstanceMgr> instance_mgr,
-                    std::shared_ptr<GlobalKVCacheMgr> global_kvcache_mgr)
-      : global_kvcache_mgr_(global_kvcache_mgr),
-        LoadBalancePolicy(instance_mgr) {};
-
-  virtual ~CacheAwareRouting() = default;
+                    const KVDirectory* directory,
+                    double host_hit_weight = 0.5,
+                    double prefill_lambda = 0.5);
 
   bool select_instances_pair(std::shared_ptr<Request> request) override;
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(CacheAwareRouting);
-
-  void cost_function(
-      const std::unordered_map<std::string, uint32_t>& overlap_scores,
-      const uint32_t& max_block_num,
-      const std::unordered_map<std::string, LoadMetrics>& load_metrics,
-      const int64_t& max_waiting_requests_num,
-      std::string* best_choice);
-
-  std::shared_ptr<GlobalKVCacheMgr> global_kvcache_mgr_;
+  const KVDirectory* directory_;
+  const double host_hit_weight_;
+  const double prefill_lambda_;
+  std::atomic<uint64_t> next_selection_{0};
 };
 
 }  // namespace xllm_service

@@ -119,23 +119,6 @@ bool EtcdClient::set(const std::string& key,
   }
 }
 
-bool EtcdClient::set(const std::string& key_prefix,
-                     const XXH3KeyCacheMap& values) {
-  bool rt = true;
-  const std::string namespaced_prefix = namespaced_key(key_prefix);
-  for (const auto& iter : values) {
-    const std::string full_key = namespaced_prefix + iter.first.to_string();
-    if (iter.second.empty()) {
-      rt = rt && client_.rm(full_key).is_ok();
-    } else {
-      rt =
-          rt &&
-          client_.put(full_key, iter.second.serialize_to_json().dump()).is_ok();
-    }
-  }
-  return rt;
-}
-
 bool EtcdClient::rm(const std::string& key) {
   auto response = client_.rm(namespaced_key(key));
   if (!response.is_ok()) {
@@ -167,32 +150,6 @@ bool EtcdClient::get(const std::string& key, std::string* value) {
   }
   if (value) {
     *value = response.value().as_string();
-  }
-  return true;
-}
-
-bool EtcdClient::get_prefix(const std::string& key_prefix,
-                            XXH3KeyCacheMap* values) {
-  const std::string full_prefix = namespaced_key(key_prefix);
-  auto response = client_.ls(full_prefix);
-  if (!response.is_ok()) {
-    LOG(ERROR) << "etcd get " << key_prefix
-               << " failed: " << response.error_message();
-    return false;
-  }
-
-  const size_t prefix_len = full_prefix.size();
-  for (int i = 0; i < response.keys().size(); i++) {
-    XXH3Key key(response.key(i).substr(prefix_len).c_str());
-    auto json_str = response.value(i).as_string();
-
-    CacheLocations value;
-    if (!value.parse_from_json(json_str)) {
-      LOG(ERROR) << "Parse json fail: " << json_str;
-      continue;
-    }
-
-    values->insert_or_assign(std::move(key), std::move(value));
   }
   return true;
 }

@@ -35,8 +35,6 @@ DECLARE_int32(rpc_server_num_threads);
 
 DECLARE_int32(rpc_server_max_concurrency);
 
-DECLARE_uint32(xxh3_128bits_seed);
-
 DECLARE_int32(timeout_ms);
 
 DECLARE_int32(connect_timeout_ms);
@@ -57,6 +55,10 @@ DECLARE_string(etcd_namespace);
 
 DECLARE_string(load_balance_policy);
 
+DECLARE_double(car_host_hit_weight);
+
+DECLARE_double(car_prefill_lambda);
+
 DECLARE_int32(detect_disconnected_instance_interval);
 
 DECLARE_int32(instance_delete_probe_timeout_ms);
@@ -66,6 +68,8 @@ DECLARE_int32(instance_delete_probe_attempts);
 DECLARE_int32(lease_lost_heartbeat_timeout_ms);
 
 DECLARE_int32(block_size);
+
+DECLARE_string(kv_events_config_file);
 
 DECLARE_string(tokenizer_path);
 

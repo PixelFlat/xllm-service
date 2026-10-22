@@ -42,6 +42,14 @@ constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
 namespace xllm_service {
 
 Scheduler::Scheduler(const Options& options) : options_(options) {
+  if (!options_.kv_events_config_file().empty()) {
+    KVDirectoryConfig config;
+    std::string error;
+    CHECK(load_kv_directory_config(
+        options_.kv_events_config_file(), &config, &error))
+        << error;
+    kv_directory_ = std::make_unique<KVDirectory>(std::move(config));
+  }
   std::optional<std::string> model_type;
 
   // vLLM-backend clusters forward the raw client JSON to vLLM, which does its
@@ -111,13 +119,14 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 
   instance_mgr_ = std::make_shared<InstanceMgr>(
       options, etcd_client_, is_master_service_, this);
-
-  global_kvcache_mgr_ = std::make_shared<GlobalKVCacheMgr>(
-      options, etcd_client_, is_master_service_);
+  start_kv_event_discovery();
 
   if (options.load_balance_policy() == "CAR") {
     lb_policy_ =
-        std::make_unique<CacheAwareRouting>(instance_mgr_, global_kvcache_mgr_);
+        std::make_unique<CacheAwareRouting>(instance_mgr_,
+                                            kv_directory_.get(),
+                                            options.car_host_hit_weight(),
+                                            options.car_prefill_lambda());
   } else if (options.load_balance_policy() == "SLO_AWARE") {
     lb_policy_ = std::make_unique<SloAwarePolicy>(options, instance_mgr_);
   } else {
@@ -137,9 +146,38 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
 }
 
 Scheduler::~Scheduler() {
+  if (kv_directory_) {
+    kv_directory_->stop();
+  }
   if (etcd_client_) {
     etcd_client_->stop_watch();
   }
+}
+
+void Scheduler::start_kv_event_discovery() {
+  if (!kv_directory_) {
+    return;
+  }
+  // The directory joins its discovery thread before the manager is destroyed.
+  kv_directory_->start([manager = instance_mgr_] {
+    const auto snapshot = manager->get_instance_snapshot();
+    std::vector<KVEventInstance> result;
+    result.reserve(snapshot.size());
+    for (const auto& instance : snapshot) {
+      if (instance.backend_type != "xllm" ||
+          instance.runtime_state == InstanceRuntimeState::SUSPECT ||
+          instance.type == InstanceType::DECODE ||
+          (instance.type == InstanceType::MIX &&
+           instance.current_type != InstanceType::PREFILL)) {
+        continue;
+      }
+      result.emplace_back(KVEventInstance{instance.name,
+                                          instance.incarnation_id,
+                                          instance.register_ts_ms,
+                                          instance.dp_size});
+    }
+    return result;
+  });
 }
 
 bool Scheduler::schedule(std::shared_ptr<Request> request) {
@@ -211,8 +249,6 @@ void Scheduler::update_master_service_heartbeat() {
   while (!exited_) {
     std::this_thread::sleep_for(std::chrono::seconds(kHeartbeatInterval));
 
-    global_kvcache_mgr_->upload_kvcache();
-
     instance_mgr_->upload_load_metrics();
   }
 }
@@ -256,7 +292,6 @@ bool Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
                                                 req->incarnation_id())) {
     return false;
   }
-  global_kvcache_mgr_->record_updated_kvcaches(req->name(), req->cache_event());
   instance_mgr_->record_load_metrics_update(req->name(), req->load_metrics());
   instance_mgr_->update_latency_metrics(req->name(), req->latency_metrics());
   return true;
@@ -276,7 +311,6 @@ void Scheduler::handle_master_service_watch(const etcd::Response& response,
     heartbeat_thread_ = std::make_unique<std::thread>(
         &Scheduler::update_master_service_heartbeat, this);
 
-    global_kvcache_mgr_->set_as_master();
     instance_mgr_->set_as_master();
   }
 }

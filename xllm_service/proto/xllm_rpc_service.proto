@@ -79,7 +79,8 @@ message LatencyMetrics {
 
 message HeartbeatRequest {
   string name = 1;
-  KvCacheEvent cache_event = 2;
+  // Legacy senders may still populate this field; KV indexing uses ZMQ only.
+  KvCacheEvent cache_event = 2 [deprecated = true];
   LoadMetrics load_metrics = 3;
   LatencyMetrics latency_metrics = 4;
   string incarnation_id = 6;

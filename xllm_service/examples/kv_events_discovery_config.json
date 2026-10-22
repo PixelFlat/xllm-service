@@ -1,0 +1,10 @@
+{
+  "discovery": {
+    "enabled": true,
+    "block_size": 128,
+    "topic": "xllm-kv",
+    "event_port_offset": 10000,
+    "replay_port_offset": 30000,
+    "refresh_interval_ms": 1000
+  }
+}
