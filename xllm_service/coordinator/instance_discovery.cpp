@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "registry/instance_discovery.h"
+#include "coordinator/instance_discovery.h"
 
 #include <array>
 #include <future>

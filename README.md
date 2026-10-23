@@ -54,7 +54,7 @@ xllm_service/
 ├── config/                # Startup configuration
 ├── router/                # Routing and request lifecycle
 ├── cluster/               # Instance state, health and engine clients
-├── registry/              # etcd discovery and service membership
+├── coordinator/           # etcd discovery and service membership
 ├── request/               # Request data, preprocessing and ordered output
 ├── kv_conductor/          # Asynchronous KV events and prefix index
 ├── http_service/          # HTTP API and response encoding
