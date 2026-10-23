@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "chat_template/jinja_chat_template.h"
 #include "common/call_data.h"
+#include "common/instance_identity.h"
 #include "common/types.h"
 #include "common/xllm/output.h"
 
@@ -69,10 +70,8 @@ struct Request {
 
   // instance routing
   Routing routing;
-  std::string prefill_incarnation_id;
-  std::string decode_incarnation_id;
-  std::optional<uint64_t> prefill_register_ts_ms;
-  std::optional<uint64_t> decode_register_ts_ms;
+  std::optional<InstanceIdentity> prefill_instance;
+  std::optional<InstanceIdentity> decode_instance;
 
   // prefill stage finished
   bool prefill_stage_finished = false;

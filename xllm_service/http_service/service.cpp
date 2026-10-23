@@ -303,7 +303,7 @@ void handle_vllm(std::shared_ptr<T> call_data,
                  const std::string& body,
                  bool stream) {
   const auto& target_name = request->routing.prefill_name;
-  auto channel = scheduler->get_channel(target_name);
+  auto channel = scheduler->get_channel(*request);
   if (channel == nullptr) {
     if (request->session_lease != nullptr) {
       request->session_lease->finish(/*failed=*/true);
@@ -391,8 +391,7 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
 
   // async redistribute the request and wait the response
   // TODO: optimize the thread pool to async mode.
-  auto& target_uri = request->routing.prefill_name;
-  auto channel = scheduler_->get_channel(target_uri);
+  auto channel = scheduler_->get_channel(*request);
   if (channel == nullptr) {
     scheduler_->finish_request(request->service_request_id, /*error=*/true);
     call_data->finish_with_error("Selected instance is not available.");
@@ -528,10 +527,12 @@ void XllmHttpServiceImpl::get_serving_models(
     return;
   }
 
-  brpc::Channel* channel_ptr =
-      scheduler_->get_channel(service_request->routing.prefill_name).get();
-
-  xllm::proto::XllmAPIService_Stub stub(channel_ptr);
+  auto channel = scheduler_->get_channel(*service_request);
+  if (channel == nullptr) {
+    call_data->finish_with_error("Selected instance is not available.");
+    return;
+  }
+  xllm::proto::XllmAPIService_Stub stub(channel.get());
   brpc::Controller* redirect_cntl = new brpc::Controller();
   auto* resp_pb = new xllm::proto::ModelListResponse();
   google::protobuf::Closure* done_callback = brpc::NewCallback(

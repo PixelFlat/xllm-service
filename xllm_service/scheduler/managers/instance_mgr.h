@@ -77,10 +77,9 @@ class InstanceMgr final {
 
   RoutingCandidates get_routing_candidates(bool require_load = true) const;
 
-  std::shared_ptr<brpc::Channel> get_channel(const std::string& instance_name);
+  std::shared_ptr<brpc::Channel> get_channel(const Request& request);
 
-  bool bind_request_instance_incarnations(
-      const std::shared_ptr<Request>& request);
+  bool bind_request_instances(const std::shared_ptr<Request>& request);
   bool request_instances_match(const Request& request) const;
   bool record_instance_heartbeat(const std::string& instance_name,
                                  const std::string& incarnation_id);
@@ -117,6 +116,7 @@ class InstanceMgr final {
   // Caller must hold cluster_mutex_.
   bool can_route_prefill_without_decode_locked(
       const std::string& prefill_name) const;
+  bool request_instances_match_locked(const Request& request) const;
 
   void init();
 

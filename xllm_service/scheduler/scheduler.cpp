@@ -243,8 +243,8 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     return false;
   }
 
-  if (!instance_mgr_->bind_request_instance_incarnations(request)) {
-    LOG(ERROR) << "Failed to bind request to instance incarnation ids. "
+  if (!instance_mgr_->bind_request_instances(request)) {
+    LOG(ERROR) << "Failed to bind request to instance identities. "
                << request->routing.debug_string();
     return false;
   }
@@ -258,9 +258,8 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
   return true;
 }
 
-std::shared_ptr<brpc::Channel> Scheduler::get_channel(
-    const std::string& target_name) {
-  return instance_mgr_->get_channel(target_name);
+std::shared_ptr<brpc::Channel> Scheduler::get_channel(const Request& request) {
+  return instance_mgr_->get_channel(request);
 }
 
 void Scheduler::update_master_service_heartbeat() {
@@ -527,8 +526,7 @@ void Scheduler::finish_request(const std::string& service_request_id,
 }
 
 void Scheduler::clear_requests_on_failed_instance(
-    const std::string& instance_name,
-    const std::string& incarnation_id,
+    const InstanceIdentity& instance,
     InstanceType type) {
   std::vector<std::shared_ptr<Request>> cleared_requests;
   {
@@ -536,13 +534,12 @@ void Scheduler::clear_requests_on_failed_instance(
     for (const auto& [service_request_id, request] : requests_) {
       const bool clear_prefill =
           ((type == InstanceType::DEFAULT || type == InstanceType::PREFILL) &&
-           request->routing.prefill_name == instance_name &&
-           request->prefill_incarnation_id == incarnation_id &&
+           request->prefill_instance &&
+           same_instance_identity(*request->prefill_instance, instance) &&
            !request->prefill_stage_finished);
       const bool clear_decode =
-          (type == InstanceType::DECODE &&
-           request->routing.decode_name == instance_name &&
-           request->decode_incarnation_id == incarnation_id);
+          (type == InstanceType::DECODE && request->decode_instance &&
+           same_instance_identity(*request->decode_instance, instance));
       if (!clear_prefill && !clear_decode) {
         continue;
       }
@@ -555,8 +552,8 @@ void Scheduler::clear_requests_on_failed_instance(
     output.status = llm::Status(llm::StatusCode::CANCELLED,
                                 "Instance is failed and deleted");
     handle_generation(std::move(output));
-    LOG(INFO) << "Clear request on failed instance: " << instance_name
-              << ", incarnation_id: " << incarnation_id
+    LOG(INFO) << "Clear request on failed instance: " << instance.name
+              << ", incarnation_id: " << instance.incarnation_id
               << ", service_request_id: " << request->service_request_id;
   }
 }

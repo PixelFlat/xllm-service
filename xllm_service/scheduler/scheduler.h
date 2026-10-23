@@ -40,7 +40,7 @@ class Scheduler final {
 
   bool schedule(std::shared_ptr<Request> request);
 
-  std::shared_ptr<brpc::Channel> get_channel(const std::string& target_name);
+  std::shared_ptr<brpc::Channel> get_channel(const Request& request);
 
   InstanceMetaInfo get_instance_info(const std::string& instance_name);
 
@@ -71,8 +71,7 @@ class Scheduler final {
   void finish_request(const std::string& service_request_id,
                       bool error = false);
 
-  void clear_requests_on_failed_instance(const std::string& instance_name,
-                                         const std::string& incarnation_id,
+  void clear_requests_on_failed_instance(const InstanceIdentity& instance,
                                          InstanceType type);
 
   // handle generations from prefill/decode instance

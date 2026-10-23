@@ -152,7 +152,7 @@ class SessionAwarePolicyTest : public testing::Test {
     if (!policy_->select_instances_pair(value)) {
       return nullptr;
     }
-    EXPECT_TRUE(manager_->bind_request_instance_incarnations(value));
+    EXPECT_TRUE(manager_->bind_request_instances(value));
     return value;
   }
 
@@ -293,7 +293,7 @@ TEST_F(SessionAwarePolicyTest, ReplacementFencesOldCompletions) {
       *manager_,
       {instance("A", InstanceType::DEFAULT, "restarted"), instance("B")});
   // A second binding pass must reject the old snapshot, not silently rebind it.
-  EXPECT_FALSE(manager_->bind_request_instance_incarnations(old));
+  EXPECT_FALSE(manager_->bind_request_instances(old));
   auto replacement = route("restart");
   ASSERT_NE(replacement, nullptr);
   EXPECT_EQ(replacement->routing.prefill_name, "B");
@@ -319,11 +319,13 @@ TEST_F(SessionAwarePolicyTest, LegacyReplacementFencesRequests) {
     auto old = route("legacy");
     ASSERT_NE(old, nullptr);
     old->session_lease->commit();
-    EXPECT_EQ(old->prefill_register_ts_ms, p.register_ts_ms);
-    EXPECT_EQ(old->decode_register_ts_ms, d.register_ts_ms);
+    ASSERT_TRUE(old->prefill_instance.has_value());
+    ASSERT_TRUE(old->decode_instance.has_value());
+    EXPECT_EQ(old->prefill_instance->register_ts_ms, p.register_ts_ms);
+    EXPECT_EQ(old->decode_instance->register_ts_ms, d.register_ts_ms);
     ++changed->register_ts_ms;
     SchedulerTestPeer::instances(*manager_, {p, d});
-    EXPECT_FALSE(manager_->bind_request_instance_incarnations(old));
+    EXPECT_FALSE(manager_->bind_request_instances(old));
     EXPECT_FALSE(manager_->request_instances_match(*old));
     EXPECT_FALSE(SchedulerTestPeer::publish(*scheduler, old));
     auto replacement = route("legacy");
@@ -331,9 +333,48 @@ TEST_F(SessionAwarePolicyTest, LegacyReplacementFencesRequests) {
     old->session_lease->finish(/*failed=*/true);
     auto repeated = route("legacy");
     ASSERT_NE(repeated, nullptr);
-    EXPECT_EQ(repeated->prefill_register_ts_ms, p.register_ts_ms);
-    EXPECT_EQ(repeated->decode_register_ts_ms, d.register_ts_ms);
+    ASSERT_TRUE(repeated->prefill_instance.has_value());
+    ASSERT_TRUE(repeated->decode_instance.has_value());
+    EXPECT_EQ(repeated->prefill_instance->register_ts_ms, p.register_ts_ms);
+    EXPECT_EQ(repeated->decode_instance->register_ts_ms, d.register_ts_ms);
     ASSERT_NO_FATAL_FAILURE(complete(repeated));
+  }
+}
+
+TEST_F(SessionAwarePolicyTest, ChannelLookupRejectsReplacedTargets) {
+  for (const bool legacy : {false, true}) {
+    auto p = instance("P", InstanceType::PREFILL, legacy ? "" : "prefill-old");
+    auto d = instance("D", InstanceType::DECODE, legacy ? "" : "decode-old");
+    SchedulerTestPeer::instances(*manager_, {p, d});
+    policy_ = make_policy(/*capacity=*/64);
+    auto channel = std::make_shared<brpc::Channel>();
+    SchedulerTestPeer::channel(*manager_, p.name, channel);
+    auto scheduler = SchedulerTestPeer::scheduler(nullptr, manager_);
+    for (auto* changed : {&p, &d}) {
+      auto old = route("dispatch");
+      ASSERT_NE(old, nullptr);
+      EXPECT_EQ(scheduler->get_channel(*old), channel);
+      if (legacy) {
+        ++changed->register_ts_ms;
+      } else {
+        changed->incarnation_id += "-new";
+      }
+      SchedulerTestPeer::instances(*manager_, {p, d});
+      channel = std::make_shared<brpc::Channel>();
+      SchedulerTestPeer::channel(*manager_, p.name, channel);
+      // Lookup must not return the new Channel for the previously bound route,
+      // including when only the Decode peer was replaced.
+      EXPECT_EQ(scheduler->get_channel(*old), nullptr);
+      auto current = route("dispatch");
+      ASSERT_NE(current, nullptr);
+      EXPECT_EQ(scheduler->get_channel(*current), channel);
+      ASSERT_NO_FATAL_FAILURE(complete(current));
+      old->session_lease->finish(/*failed=*/true);
+      auto repeated = route("dispatch");
+      ASSERT_NE(repeated, nullptr);
+      EXPECT_EQ(scheduler->get_channel(*repeated), channel);
+      ASSERT_NO_FATAL_FAILURE(complete(repeated));
+    }
   }
 }
 

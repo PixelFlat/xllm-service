@@ -25,7 +25,7 @@ limitations under the License.
 
 namespace xllm_service {
 
-class SessionAffinityState;
+class SessionTable;
 
 // A request's hold on a binding. Unconfirmed placement is discarded when its
 // last hold ends. The shared state can outlive its scheduler during callbacks.
@@ -36,12 +36,13 @@ class SessionLease final {
   void finish(bool failed);
 
  private:
+  friend class SessionTable;
   friend class SessionAwarePolicy;
-  SessionLease(std::shared_ptr<SessionAffinityState> state,
+  SessionLease(std::shared_ptr<SessionTable> table,
                std::string key,
                uint64_t version);
 
-  std::shared_ptr<SessionAffinityState> state_;
+  std::shared_ptr<SessionTable> table_;
   std::string key_;
   uint64_t version_;
   std::atomic<bool> finished_{false};
@@ -63,7 +64,7 @@ class SessionAwarePolicy final : public LoadBalancePolicy {
 
  private:
   std::unique_ptr<LoadBalancePolicy> fallback_;
-  std::shared_ptr<SessionAffinityState> state_;
+  std::shared_ptr<SessionTable> table_;
 };
 
 }  // namespace xllm_service

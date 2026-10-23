@@ -28,15 +28,19 @@ limitations under the License.
 namespace xllm_service {
 namespace {
 
-struct Binding {
-  RoutingCandidate prefill;
-  std::optional<RoutingCandidate> decode;
-  uint64_t version = 0;
-  uint64_t active = 0;
-  bool committed = false;
-  SessionAwarePolicy::TimePoint idle_since;
-  std::optional<std::list<std::string>::iterator> idle_position;
+struct SessionRoute {
+  InstanceIdentity prefill;
+  std::optional<InstanceIdentity> decode;
 };
+
+struct SessionSelection {
+  SessionRoute route;
+  uint64_t version;
+};
+
+InstanceIdentity identity(const RoutingCandidate& candidate) {
+  return {candidate.name, candidate.incarnation_id, candidate.register_ts_ms};
+}
 
 const RoutingCandidate* find_candidate(
     const std::vector<RoutingCandidate>& candidates,
@@ -48,48 +52,71 @@ const RoutingCandidate* find_candidate(
   return found == candidates.end() ? nullptr : &*found;
 }
 
-bool same_instance(const RoutingCandidate& left,
-                   const RoutingCandidate& right) {
-  return left.name == right.name &&
-         left.incarnation_id == right.incarnation_id &&
-         (!left.incarnation_id.empty() ||
-          left.register_ts_ms == right.register_ts_ms);
-}
-
 const RoutingCandidate* bound_candidate(
     const std::vector<RoutingCandidate>& candidates,
-    const RoutingCandidate& target) {
+    const InstanceIdentity& target) {
   const auto* found = find_candidate(candidates, target.name);
-  return found != nullptr && same_instance(*found, target) ? found : nullptr;
+  return found != nullptr && same_instance_identity(target,
+                                                    found->name,
+                                                    found->incarnation_id,
+                                                    found->register_ts_ms)
+             ? found
+             : nullptr;
 }
 
-bool set_route(const std::shared_ptr<Request>& request,
-               InstanceMgr& manager,
-               const RoutingCandidate* prefill,
-               const RoutingCandidate* decode) {
+std::optional<SessionRoute> select_route(
+    const RoutingCandidates& candidates,
+    const SessionRoute* previous,
+    const std::optional<Routing>& proposal) {
+  const auto* prefill =
+      previous == nullptr
+          ? nullptr
+          : bound_candidate(candidates.prefill, previous->prefill);
+  const auto* decode =
+      previous == nullptr || !previous->decode
+          ? nullptr
+          : bound_candidate(candidates.decode, *previous->decode);
+  const bool complete =
+      prefill != nullptr &&
+      (decode != nullptr ||
+       (!previous->decode && prefill->type == InstanceType::DEFAULT));
+  if (!complete) {
+    if (!proposal) {
+      return std::nullopt;
+    }
+    if (decode == nullptr) {
+      decode = find_candidate(candidates.decode, proposal->decode_name);
+    }
+    if (prefill == nullptr ||
+        (decode == nullptr && prefill->type != InstanceType::DEFAULT)) {
+      prefill = find_candidate(candidates.prefill, proposal->prefill_name);
+    }
+  }
   if (prefill == nullptr ||
       (decode == nullptr && prefill->type != InstanceType::DEFAULT)) {
-    return false;
+    return std::nullopt;
   }
-  request->routing.prefill_name = prefill->name;
-  request->routing.decode_name = decode == nullptr ? "" : decode->name;
-  request->prefill_incarnation_id = prefill->incarnation_id;
-  request->decode_incarnation_id =
-      decode == nullptr ? "" : decode->incarnation_id;
-  request->prefill_register_ts_ms = prefill->register_ts_ms;
-  request->decode_register_ts_ms =
-      decode == nullptr ? std::nullopt
-                        : std::optional<uint64_t>(decode->register_ts_ms);
-  return manager.bind_request_instance_incarnations(request);
+  return SessionRoute{identity(*prefill),
+                      decode == nullptr
+                          ? std::nullopt
+                          : std::optional<InstanceIdentity>(identity(*decode))};
+}
+
+bool same_route(const SessionRoute& left, const SessionRoute& right) {
+  return same_instance_identity(left.prefill, right.prefill) &&
+         left.decode.has_value() == right.decode.has_value() &&
+         (!left.decode || same_instance_identity(*left.decode, *right.decode));
 }
 
 }  // namespace
 
-class SessionAffinityState final {
+// Owns all binding transitions. Policies and leases never access its containers
+// or mutex; selection consumes only local candidate snapshots.
+class SessionTable final {
  public:
-  SessionAffinityState(int32_t ttl_s,
-                       int32_t max_entries,
-                       SessionAwarePolicy::Clock clock)
+  SessionTable(int32_t ttl_s,
+               int32_t max_entries,
+               SessionAwarePolicy::Clock clock)
       : ttl_(std::chrono::seconds(ttl_s)),
         max_entries_(static_cast<size_t>(max_entries)),
         clock_(std::move(clock)) {
@@ -98,12 +125,101 @@ class SessionAffinityState final {
     CHECK(clock_);
   }
 
-  void erase(const std::string& key) {
-    const auto found = bindings_.find(key);
+  std::optional<SessionSelection> acquire(
+      const std::string& key,
+      const RoutingCandidates& candidates,
+      const std::optional<Routing>& proposal = std::nullopt) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    expire(clock_());
+    auto found = bindings_.find(key);
+    auto route =
+        select_route(candidates,
+                     found == bindings_.end() ? nullptr : &found->second.route,
+                     proposal);
+    if (!route) {
+      return std::nullopt;
+    }
     if (found == bindings_.end()) {
+      if (bindings_.size() >= max_entries_) {
+        if (idle_.empty()) {
+          LOG(ERROR)
+              << "Session affinity capacity is occupied by active requests";
+          return std::nullopt;
+        }
+        erase(idle_.front());
+      }
+      found = bindings_.emplace(key, Binding{}).first;
+    }
+    auto& binding = found->second;
+    if (binding.idle_position) {
+      idle_.erase(*binding.idle_position);
+      binding.idle_position.reset();
+    }
+    if (!same_route(binding.route, *route)) {
+      binding.route = *route;
+      binding.version = ++next_version_;
+      binding.active = 0;
+      binding.committed = false;
+    }
+    ++binding.active;
+    return SessionSelection{std::move(*route), binding.version};
+  }
+
+  void commit(SessionLease& lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (lease.finished_.load(std::memory_order_relaxed)) {
       return;
     }
-    if (found->second.idle_position.has_value()) {
+    const auto found = bindings_.find(lease.key_);
+    if (found == bindings_.end() || found->second.version != lease.version_) {
+      // A newer binding superseded this request; future callbacks are no-ops.
+      lease.finished_.store(true, std::memory_order_relaxed);
+      return;
+    }
+    found->second.committed = true;
+    lease.committed_.store(true, std::memory_order_relaxed);
+  }
+
+  void finish(SessionLease& lease, bool failed) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (lease.finished_.exchange(true, std::memory_order_relaxed)) {
+      return;
+    }
+    const auto found = bindings_.find(lease.key_);
+    if (found == bindings_.end() || found->second.version != lease.version_) {
+      return;
+    }
+    auto& binding = found->second;
+    if (failed) {
+      erase(lease.key_);
+      return;
+    }
+    CHECK_GT(binding.active, 0);
+    if (--binding.active != 0) {
+      return;
+    }
+    if (!binding.committed) {
+      erase(lease.key_);
+      return;
+    }
+    binding.idle_since = clock_();
+    idle_.emplace_back(lease.key_);
+    binding.idle_position = std::prev(idle_.end());
+  }
+
+ private:
+  struct Binding {
+    SessionRoute route;
+    uint64_t version = 0;
+    uint64_t active = 0;
+    bool committed = false;
+    SessionAwarePolicy::TimePoint idle_since;
+    std::optional<std::list<std::string>::iterator> idle_position;
+  };
+
+  void erase(const std::string& key) {
+    const auto found = bindings_.find(key);
+    if (found->second.idle_position) {
       idle_.erase(*found->second.idle_position);
     }
     bindings_.erase(found);
@@ -121,58 +237,29 @@ class SessionAffinityState final {
   const size_t max_entries_;
   SessionAwarePolicy::Clock clock_;
   std::unordered_map<std::string, Binding> bindings_;
-  // Only idle, committed bindings appear here; active requests cannot be
-  // evicted.
+  // Only idle, committed bindings can expire or be evicted.
   std::list<std::string> idle_;
   uint64_t next_version_ = 0;
 };
 
-SessionLease::SessionLease(std::shared_ptr<SessionAffinityState> state,
+SessionLease::SessionLease(std::shared_ptr<SessionTable> table,
                            std::string key,
                            uint64_t version)
-    : state_(std::move(state)), key_(std::move(key)), version_(version) {}
+    : table_(std::move(table)), key_(std::move(key)), version_(version) {}
 
 SessionLease::~SessionLease() { finish(/*failed=*/false); }
 
 void SessionLease::commit() {
-  if (committed_.load(std::memory_order_relaxed) ||
-      finished_.load(std::memory_order_relaxed)) {
-    return;
-  }
-  std::lock_guard<std::mutex> lock(state_->mutex_);
-  const auto found = state_->bindings_.find(key_);
-  if (!finished_.load(std::memory_order_relaxed) &&
-      found != state_->bindings_.end() && found->second.version == version_) {
-    found->second.committed = true;
-    committed_.store(true, std::memory_order_relaxed);
+  if (!committed_.load(std::memory_order_relaxed) &&
+      !finished_.load(std::memory_order_relaxed)) {
+    table_->commit(*this);
   }
 }
 
 void SessionLease::finish(bool failed) {
-  std::lock_guard<std::mutex> lock(state_->mutex_);
-  if (finished_.exchange(true, std::memory_order_relaxed)) {
-    return;
+  if (!finished_.load(std::memory_order_relaxed)) {
+    table_->finish(*this, failed);
   }
-  const auto found = state_->bindings_.find(key_);
-  if (found == state_->bindings_.end() || found->second.version != version_) {
-    return;
-  }
-  auto& binding = found->second;
-  if (failed) {
-    state_->erase(key_);
-    return;
-  }
-  CHECK_GT(binding.active, 0);
-  if (--binding.active != 0) {
-    return;
-  }
-  if (!binding.committed) {
-    state_->erase(key_);
-    return;
-  }
-  binding.idle_since = state_->clock_();
-  state_->idle_.emplace_back(key_);
-  binding.idle_position = std::prev(state_->idle_.end());
 }
 
 SessionAwarePolicy::SessionAwarePolicy(
@@ -183,9 +270,9 @@ SessionAwarePolicy::SessionAwarePolicy(
     Clock clock)
     : LoadBalancePolicy(std::move(instance_mgr)),
       fallback_(std::move(fallback)),
-      state_(std::make_shared<SessionAffinityState>(ttl_s,
-                                                    max_entries,
-                                                    std::move(clock))) {
+      table_(std::make_shared<SessionTable>(ttl_s,
+                                            max_entries,
+                                            std::move(clock))) {
   CHECK(fallback_ != nullptr);
 }
 
@@ -201,90 +288,31 @@ bool SessionAwarePolicy::select_instances_pair(
   key.append(request->model);
   key.append(session_id.data(), session_id.size());
 
-  // Expensive fallback work (including CAR prefix lookup) runs without the
-  // session mutex. Re-read the binding afterward so concurrent initial turns
-  // adopt the first placement that acquired a lease.
-  bool placement_attempted = false;
-  std::optional<Routing> proposal;
-  for (;;) {
-    auto candidates =
-        instance_mgr_->get_routing_candidates(/*require_load=*/false);
-    std::unique_lock<std::mutex> lock(state_->mutex_);
-    state_->expire(state_->clock_());
-    auto found = state_->bindings_.find(key);
-    const Binding* previous =
-        found == state_->bindings_.end() ? nullptr : &found->second;
-    const RoutingCandidate* prefill =
-        previous == nullptr
-            ? nullptr
-            : bound_candidate(candidates.prefill, previous->prefill);
-    const RoutingCandidate* decode =
-        previous == nullptr || !previous->decode
-            ? nullptr
-            : bound_candidate(candidates.decode, *previous->decode);
-    const bool complete =
-        prefill != nullptr &&
-        (decode != nullptr ||
-         (!previous->decode && prefill->type == InstanceType::DEFAULT));
-    if (!complete && !placement_attempted) {
-      lock.unlock();
-      placement_attempted = true;
-      if (fallback_->select_instances_pair(request)) {
-        proposal = request->routing;
-      }
-      continue;
+  auto selected = table_->acquire(
+      key, instance_mgr_->get_routing_candidates(/*require_load=*/false));
+  if (!selected) {
+    // Fallback may perform an expensive CAR lookup. Reconcile afterward with
+    // any provisional placement established by a concurrent first turn.
+    std::optional<Routing> proposal;
+    if (fallback_->select_instances_pair(request)) {
+      proposal = request->routing;
     }
-    if (!complete) {
-      if (!proposal.has_value()) {
-        return false;
-      }
-      if (decode == nullptr) {
-        decode = find_candidate(candidates.decode, proposal->decode_name);
-      }
-      if (prefill == nullptr ||
-          (decode == nullptr && prefill->type != InstanceType::DEFAULT)) {
-        prefill = find_candidate(candidates.prefill, proposal->prefill_name);
-      }
-    }
-
-    if (!set_route(request, *instance_mgr_, prefill, decode)) {
-      return false;
-    }
-
-    if (previous == nullptr) {
-      if (state_->bindings_.size() >= state_->max_entries_) {
-        if (state_->idle_.empty()) {
-          LOG(ERROR)
-              << "Session affinity capacity is occupied by active requests";
-          return false;
-        }
-        state_->erase(state_->idle_.front());
-      }
-      found = state_->bindings_.emplace(key, Binding{}).first;
-    }
-    auto& binding = found->second;
-    if (binding.idle_position.has_value()) {
-      state_->idle_.erase(*binding.idle_position);
-      binding.idle_position.reset();
-    }
-    const bool unchanged =
-        same_instance(binding.prefill, *prefill) &&
-        binding.decode.has_value() == (decode != nullptr) &&
-        (decode == nullptr || same_instance(*binding.decode, *decode));
-    if (!unchanged) {
-      binding.prefill = *prefill;
-      binding.decode = decode == nullptr
-                           ? std::nullopt
-                           : std::optional<RoutingCandidate>(*decode);
-      binding.version = ++state_->next_version_;
-      binding.active = 0;
-      binding.committed = false;
-    }
-    ++binding.active;
-    request->session_lease = std::shared_ptr<SessionLease>(
-        new SessionLease(state_, std::move(key), binding.version));
-    return true;
+    selected = table_->acquire(
+        key,
+        instance_mgr_->get_routing_candidates(/*require_load=*/false),
+        proposal);
   }
+  if (!selected) {
+    return false;
+  }
+  request->routing.prefill_name = selected->route.prefill.name;
+  request->routing.decode_name =
+      selected->route.decode ? selected->route.decode->name : "";
+  request->prefill_instance = std::move(selected->route.prefill);
+  request->decode_instance = std::move(selected->route.decode);
+  request->session_lease = std::shared_ptr<SessionLease>(
+      new SessionLease(table_, std::move(key), selected->version));
+  return true;
 }
 
 }  // namespace xllm_service
