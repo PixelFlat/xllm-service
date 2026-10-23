@@ -86,9 +86,20 @@ DEFINE_int32(idle_timeout_s,
              "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
 
-DEFINE_string(load_balance_policy,
-              "RR",
-              "Disaggregated prefill-decode policy.");
+DEFINE_string(
+    load_balance_policy,
+    "RR",
+    "Disaggregated prefill-decode policy: RR, CAR, SLO_AWARE, LEAST_TIME.");
+
+DEFINE_string(mooncake_prefix_config_file,
+              "",
+              "LEAST_TIME Mooncake metadata lookup JSON. Empty disables Store "
+              "hints and estimates uncached prefill compute.");
+
+DEFINE_string(prefill_time_profile_file,
+              "",
+              "LEAST_TIME JSON mapping instance names to [tokens, latency_ms] "
+              "profiling pairs; overrides engine TTFT profiling when present.");
 
 DEFINE_double(car_host_hit_weight,
               0.5,

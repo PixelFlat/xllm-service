@@ -1,6 +1,12 @@
 include(cc_test)
 
 cc_test(
+  NAME least_time_policy_test
+  SRCS least_time_policy_test.cpp
+  DEPS :scheduler GTest::gtest_main
+)
+
+cc_test(
   NAME
     request_output_test
   SRCS

@@ -71,6 +71,9 @@ struct Request {
 
   // the estimated TTFT obtained from the TTFT predictor
   int64_t estimated_ttft = 0;
+  // LEAST_TIME reserves both peers atomically during selection.
+  bool time_routing_reserved = false;
+  int32_t store_cached_tokens = 0;
 
   // output callback
   OutputCallback output_callback;
