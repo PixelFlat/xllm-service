@@ -1,6 +1,8 @@
-# Predicted prefill load balancing
+# DeepSeek load balancing
 
-Select `--load_balance_policy=LEAST_TIME` to route each generation request to
+The `ds_load_balance` policy adapts the instance-level Prefill/Decode routing
+described in DeepSeek's deployment article. Select
+`--load_balance_policy=ds_load_balance` to route each generation request to
 the healthy prefill engine with the smallest assigned prefill workload:
 
 ```text
@@ -100,7 +102,7 @@ When building against a paired engine checkout with newer public schemas, also
 set the existing `-DXLLM_PROTO_DIR=/path/to/paired-engine/xllm/proto` option.
 
 The normal build defaults to `USE_MOONCAKE_PREFIX_LOOKUP=OFF` and has no
-Mooncake dependency. LEAST_TIME without a Mooncake configuration estimates
+Mooncake dependency. ds_load_balance without a Mooncake configuration estimates
 uncached prefill. Supplying a Mooncake configuration to a build without the
 adapter fails at startup.
 
@@ -162,7 +164,7 @@ Keep the usual etcd and engine settings; add the new policy/configuration flags:
 ./build/xllm_service/xllm_master_serving \
   --tokenizer_path=/mnt/models/your-model \
   --etcd_addr=127.0.0.1:2379 \
-  --load_balance_policy=LEAST_TIME \
+  --load_balance_policy=ds_load_balance \
   --prefill_time_profile_file=/path/prefill_profiles.json \
   --mooncake_prefix_config_file=/path/mooncake_prefix.json \
   --v=1
@@ -174,7 +176,7 @@ Run the focused tests after building:
 
 ```bash
 ctest --test-dir build --output-on-failure \
-  -R 'LeastTimePolicyTest|PrefillTimePredictorTest|MooncakePrefixTest|RequestMetricsTest|RequestAdmissionTest'
+  -R 'DsLoadBalanceTest|PrefillTimePredictorTest|MooncakePrefixTest|RequestMetricsTest|RequestAdmissionTest'
 ```
 
 ## Scope of the estimate
@@ -222,14 +224,14 @@ Mooncake used a 2 GiB DRAM segment and a 2 GiB bucket-backend disk quota.
 | Cancellation | One stream was deliberately cancelled. Four subsequent probes completed, and P compute reservations and D request/token counters returned to zero. |
 | Disk offload | Store metrics and cache files confirmed disk writes. This run did not force a cold SSD read. |
 
-Ten LEAST_TIME requests completed, in addition to the deliberately cancelled
+Ten requests using this policy completed, in addition to the deliberately cancelled
 request. Second-turn client TTFT in the multi-turn case was about 669 ms. There
 was no Mooncake-disabled comparison, and these results do not establish a TTFT
 improvement or large-concurrency performance. The first turn was non-streaming;
 its full-response latency must not be interpreted as TTFT.
 
 An initial engine request combining `min_tokens` and `ignore_eos` failed task
-pipeline sampling validation on D, before switching to LEAST_TIME. Final test
+pipeline sampling validation on D, before switching to this policy. Final test
 requests used `max_tokens` and `ignore_eos`, omitting `min_tokens`. This engine
 limitation is not fixed by the routing change. A private CPUinfo snapshot mount
 was also needed to work around a host-specific `/proc/cpuinfo` read stall during

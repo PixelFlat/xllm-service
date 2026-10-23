@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "scheduler/loadbalance_policy/least_time_policy.h"
+#include "scheduler/loadbalance_policy/ds_load_balance.h"
 
 #include <gtest/gtest.h>
 #include <xxhash.h>
@@ -35,7 +35,7 @@ class SchedulerTestPeer final {
   static std::shared_ptr<InstanceMgr> create() {
     auto scheduler = std::shared_ptr<Scheduler>(new Scheduler());
     auto manager = std::shared_ptr<InstanceMgr>(new InstanceMgr());
-    manager->options_.load_balance_policy("LEAST_TIME");
+    manager->options_.load_balance_policy("ds_load_balance");
     manager->scheduler_ = scheduler.get();
     scheduler->instance_mgr_ = manager;
     // Keep the scheduler (and therefore its manager) alive for the test.
@@ -98,12 +98,12 @@ std::shared_ptr<Request> make_request() {
   return request;
 }
 
-TEST(LeastTimePolicyTest, AccountsNewRequestAndQueuedWorkWithoutRoleFlips) {
+TEST(DsLoadBalanceTest, AccountsNewRequestAndQueuedWorkWithoutRoleFlips) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "fast", InstanceType::PREFILL);
   SchedulerTestPeer::add(*manager, "slow", InstanceType::PREFILL, 2.0);
   SchedulerTestPeer::add(*manager, "decode", InstanceType::DECODE);
-  LeastTimePolicy policy(manager, nullptr);
+  DsLoadBalance policy(manager, nullptr);
   auto first = make_request();
   auto second = make_request();
   auto third = make_request();
@@ -126,15 +126,15 @@ TEST(LeastTimePolicyTest, AccountsNewRequestAndQueuedWorkWithoutRoleFlips) {
             0);
 }
 
-TEST(LeastTimePolicyTest, PrefillSelectsExistingLoadBeforeReservingNewWork) {
+TEST(DsLoadBalanceTest, PrefillSelectsExistingLoadBeforeReservingNewWork) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "fast", InstanceType::PREFILL);
   SchedulerTestPeer::add(*manager, "slow", InstanceType::PREFILL, 10.0);
   SchedulerTestPeer::add(*manager, "d", InstanceType::DECODE);
   auto first = make_request();
   auto second = make_request();
-  ASSERT_TRUE(manager->select_instance_pair_on_time(first, {}));
-  ASSERT_TRUE(manager->select_instance_pair_on_time(second, {}));
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(first, {}));
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(second, {}));
   EXPECT_EQ(first->routing.prefill_name, "fast");
   EXPECT_EQ(second->routing.prefill_name, "slow");
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "slow").estimated_prefill_time,
@@ -142,7 +142,7 @@ TEST(LeastTimePolicyTest, PrefillSelectsExistingLoadBeforeReservingNewWork) {
   EXPECT_GT(second->estimated_ttft, first->estimated_ttft);
 }
 
-TEST(LeastTimePolicyTest, DecodeBalancesRequestsWithinTokenThreshold) {
+TEST(DsLoadBalanceTest, DecodeBalancesRequestsWithinTokenThreshold) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "p", InstanceType::PREFILL);
   SchedulerTestPeer::add(*manager, "d1", InstanceType::DECODE);
@@ -152,13 +152,15 @@ TEST(LeastTimePolicyTest, DecodeBalancesRequestsWithinTokenThreshold) {
   SchedulerTestPeer::set_decode_load(*manager, "d1", 1, 50000);
   SchedulerTestPeer::set_decode_load(*manager, "d2", 100, 48000);
   auto short_request = make_request();
-  ASSERT_TRUE(manager->select_instance_pair_on_time(short_request, {}));
+  ASSERT_TRUE(
+      manager->select_instance_pair_on_ds_load_balance(short_request, {}));
   EXPECT_EQ(short_request->routing.decode_name, "d1");
   manager->update_request_metrics(short_request, RequestAction::CANCEL);
 
   auto long_request = make_request();
   long_request->token_ids.resize(20000, 42);
-  ASSERT_TRUE(manager->select_instance_pair_on_time(long_request, {}));
+  ASSERT_TRUE(
+      manager->select_instance_pair_on_ds_load_balance(long_request, {}));
   EXPECT_EQ(long_request->routing.decode_name, "d2");
   manager->update_request_metrics(long_request, RequestAction::CANCEL);
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "d1").decode_token_num, 50000);
@@ -168,16 +170,16 @@ TEST(LeastTimePolicyTest, DecodeBalancesRequestsWithinTokenThreshold) {
   SchedulerTestPeer::set_decode_load(*manager, "d1", 1, 64000);
   SchedulerTestPeer::set_decode_load(*manager, "d2", 100, 32000);
   auto request = make_request();
-  ASSERT_TRUE(manager->select_instance_pair_on_time(request, {}));
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(request, {}));
   EXPECT_EQ(request->routing.decode_name, "d2");
 }
 
-TEST(LeastTimePolicyTest, UsesCompatiblePrefixAndReleasesOnlyOnceAfterHandoff) {
+TEST(DsLoadBalanceTest, UsesCompatiblePrefixAndReleasesOnlyOnceAfterHandoff) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "p", InstanceType::PREFILL);
   SchedulerTestPeer::add(*manager, "d", InstanceType::DECODE);
   auto request = make_request();
-  ASSERT_TRUE(manager->select_instance_pair_on_time(
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(
       request, {{"p", PrefillCacheHint{"p-generation", 50}}}));
   EXPECT_EQ(request->store_cached_tokens, 50);
   EXPECT_NEAR(request->estimated_ttft, 23, 1);
@@ -198,26 +200,26 @@ TEST(LeastTimePolicyTest, UsesCompatiblePrefixAndReleasesOnlyOnceAfterHandoff) {
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "p").prefill_request_num, 0);
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "d").decode_token_num, 0);
   auto stale = make_request();
-  ASSERT_TRUE(manager->select_instance_pair_on_time(
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(
       stale, {{"p", PrefillCacheHint{"old-generation", 99}}}));
   EXPECT_EQ(stale->store_cached_tokens, 0);
 }
 
-TEST(LeastTimePolicyTest, RejectsMissingProfilesAndUnavailableDecode) {
+TEST(DsLoadBalanceTest, RejectsMissingProfilesAndUnavailableDecode) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "p", InstanceType::PREFILL);
   auto request = make_request();
-  EXPECT_FALSE(manager->select_instance_pair_on_time(request, {}));
-  EXPECT_FALSE(request->time_routing_reserved);
+  EXPECT_FALSE(manager->select_instance_pair_on_ds_load_balance(request, {}));
+  EXPECT_FALSE(request->ds_load_balance_reserved);
   SchedulerTestPeer::add(*manager, "default", InstanceType::DEFAULT, 1, false);
-  EXPECT_FALSE(manager->select_instance_pair_on_time(request, {}));
+  EXPECT_FALSE(manager->select_instance_pair_on_ds_load_balance(request, {}));
   SchedulerTestPeer::add(*manager, "ready", InstanceType::DEFAULT);
-  ASSERT_TRUE(manager->select_instance_pair_on_time(request, {}));
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(request, {}));
   EXPECT_EQ(request->routing.prefill_name, "ready");
   EXPECT_TRUE(request->routing.decode_name.empty());
 }
 
-TEST(LeastTimePolicyTest, ConcurrentSelectionsReserveBeforeTheNextSelection) {
+TEST(DsLoadBalanceTest, ConcurrentSelectionsReserveBeforeTheNextSelection) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "p1", InstanceType::PREFILL);
   SchedulerTestPeer::add(*manager, "p2", InstanceType::PREFILL);
@@ -227,7 +229,8 @@ TEST(LeastTimePolicyTest, ConcurrentSelectionsReserveBeforeTheNextSelection) {
   futures.reserve(16);
   for (int32_t index = 0; index < 16; ++index) {
     futures.emplace_back(std::async(std::launch::async, [manager] {
-      return manager->select_instance_pair_on_time(make_request(), {});
+      return manager->select_instance_pair_on_ds_load_balance(make_request(),
+                                                              {});
     }));
   }
   for (auto& future : futures) {
@@ -239,21 +242,21 @@ TEST(LeastTimePolicyTest, ConcurrentSelectionsReserveBeforeTheNextSelection) {
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "d2").decode_request_num, 8);
 }
 
-TEST(LeastTimePolicyTest, DuplicateAdmissionPreservesActiveReservation) {
+TEST(DsLoadBalanceTest, DuplicateAdmissionPreservesActiveReservation) {
   auto manager = SchedulerTestPeer::create();
   SchedulerTestPeer::add(*manager, "p", InstanceType::PREFILL);
   SchedulerTestPeer::add(*manager, "d", InstanceType::DECODE);
   auto original = make_request();
   original->service_request_id = "duplicate";
-  ASSERT_TRUE(manager->select_instance_pair_on_time(original, {}));
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(original, {}));
   ASSERT_TRUE(SchedulerTestPeer::publish(*manager, original));
   EXPECT_FALSE(SchedulerTestPeer::publish(*manager, original));
-  EXPECT_TRUE(original->time_routing_reserved);
+  EXPECT_TRUE(original->ds_load_balance_reserved);
   auto duplicate = make_request();
   duplicate->service_request_id = original->service_request_id;
-  ASSERT_TRUE(manager->select_instance_pair_on_time(duplicate, {}));
+  ASSERT_TRUE(manager->select_instance_pair_on_ds_load_balance(duplicate, {}));
   EXPECT_FALSE(SchedulerTestPeer::publish(*manager, duplicate));
-  EXPECT_FALSE(duplicate->time_routing_reserved);
+  EXPECT_FALSE(duplicate->ds_load_balance_reserved);
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "p").prefill_request_num, 1);
   SchedulerTestPeer::finish(*manager, original->service_request_id);
   EXPECT_EQ(SchedulerTestPeer::metrics(*manager, "p").estimated_prefill_time,

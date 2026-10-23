@@ -22,10 +22,10 @@ limitations under the License.
 
 namespace xllm_service {
 
-class LeastTimePolicy final : public LoadBalancePolicy {
+class DsLoadBalance final : public LoadBalancePolicy {
  public:
-  LeastTimePolicy(std::shared_ptr<InstanceMgr> instance_mgr,
-                  std::unique_ptr<MooncakePrefixLookup> prefix_lookup);
+  DsLoadBalance(std::shared_ptr<InstanceMgr> instance_mgr,
+                std::unique_ptr<MooncakePrefixLookup> prefix_lookup);
 
   bool select_instances_pair(std::shared_ptr<Request> request) override;
 

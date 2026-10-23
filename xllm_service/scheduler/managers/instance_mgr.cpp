@@ -847,16 +847,17 @@ void InstanceMgr::update_request_metrics(
     const std::shared_ptr<Request>& request,
     RequestAction action,
     int64_t generated_tokens) {
-  const bool least_time = options_.load_balance_policy() == "LEAST_TIME";
-  if (options_.load_balance_policy() != "SLO_AWARE" && !least_time) {
+  const bool ds_load_balance =
+      options_.load_balance_policy() == "ds_load_balance";
+  if (options_.load_balance_policy() != "SLO_AWARE" && !ds_load_balance) {
     return;
   }
 
   std::scoped_lock<std::shared_mutex, std::shared_mutex> lock(cluster_mutex_,
                                                               metrics_mutex_);
 
-  if (least_time &&
-      (!request->time_routing_reserved || action == RequestAction::SCHEDULE)) {
+  if (ds_load_balance && (!request->ds_load_balance_reserved ||
+                          action == RequestAction::SCHEDULE)) {
     return;
   }
 
@@ -878,17 +879,17 @@ void InstanceMgr::update_request_metrics(
           request->decode_incarnation_id) {
     apply_decode_request_metrics(
         *request, action, decode_it->second, generated_tokens);
-    if (!least_time && decode_it->second.decode_request_num == 0) {
+    if (!ds_load_balance && decode_it->second.decode_request_num == 0) {
       flip_decode_to_prefill(request->routing.decode_name);
     }
   }
-  if (least_time && (action == RequestAction::CANCEL ||
-                     action == RequestAction::FINISH_DECODE)) {
-    request->time_routing_reserved = false;
+  if (ds_load_balance && (action == RequestAction::CANCEL ||
+                          action == RequestAction::FINISH_DECODE)) {
+    request->ds_load_balance_reserved = false;
   }
 }
 
-bool InstanceMgr::select_instance_pair_on_time(
+bool InstanceMgr::select_instance_pair_on_ds_load_balance(
     const std::shared_ptr<Request>& request,
     const std::unordered_map<std::string, PrefillCacheHint>& cache_hints) {
   if (request->token_ids.empty() ||
@@ -897,7 +898,7 @@ bool InstanceMgr::select_instance_pair_on_time(
     return false;
   }
   std::scoped_lock lock(cluster_mutex_, metrics_mutex_);
-  if (request->time_routing_reserved) {
+  if (request->ds_load_balance_reserved) {
     return false;
   }
   const int32_t length = static_cast<int32_t>(request->token_ids.size());
@@ -990,7 +991,7 @@ bool InstanceMgr::select_instance_pair_on_time(
   }
   if (prefill_name.empty()) {
     LOG(ERROR)
-        << "LEAST_TIME needs a healthy prefill engine with valid TTFT "
+        << "ds_load_balance needs a healthy prefill engine with valid TTFT "
            "profiling (at least three distinct lengths) and a decode peer";
     return false;
   }
@@ -1001,7 +1002,7 @@ bool InstanceMgr::select_instance_pair_on_time(
       decode_name.empty() ? "" : instances_.at(decode_name).incarnation_id;
   request->estimated_ttft = selected_cost;
   request->store_cached_tokens = selected_cached_tokens;
-  request->time_routing_reserved = true;
+  request->ds_load_balance_reserved = true;
   auto& prefill_metrics = request_metrics_.at(prefill_name);
   prefill_metrics.estimated_prefill_time += selected_cost;
   apply_prefill_request_metrics(
@@ -1018,7 +1019,8 @@ bool InstanceMgr::select_instance_pair_on_time(
         std::find(decode_index_.begin(), decode_index_.end(), decode_name) -
         decode_index_.begin() + 1;
   }
-  VLOG(1) << "LEAST_TIME prefill=" << prefill_name << " decode=" << decode_name
+  VLOG(1) << "ds_load_balance prefill=" << prefill_name
+          << " decode=" << decode_name
           << " store_hit_tokens=" << selected_cached_tokens
           << " compute_ms=" << selected_cost
           << " queued_compute_ms=" << min_queued_time

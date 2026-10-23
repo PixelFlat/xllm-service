@@ -1,8 +1,8 @@
 include(cc_test)
 
 cc_test(
-  NAME least_time_policy_test
-  SRCS least_time_policy_test.cpp
+  NAME ds_load_balance_test
+  SRCS ds_load_balance_test.cpp
   DEPS :scheduler GTest::gtest_main
 )
 

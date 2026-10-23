@@ -101,7 +101,7 @@ class InstanceMgr final {
   bool select_instance_pair_on_slo(std::shared_ptr<Request> request);
 
   // Selection, incarnation binding and reservation share one topology lock.
-  bool select_instance_pair_on_time(
+  bool select_instance_pair_on_ds_load_balance(
       const std::shared_ptr<Request>& request,
       const std::unordered_map<std::string, PrefillCacheHint>& cache_hints);
 

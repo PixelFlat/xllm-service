@@ -13,19 +13,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "scheduler/loadbalance_policy/least_time_policy.h"
+#include "scheduler/loadbalance_policy/ds_load_balance.h"
 
 #include <utility>
 
 namespace xllm_service {
 
-LeastTimePolicy::LeastTimePolicy(
+DsLoadBalance::DsLoadBalance(
     std::shared_ptr<InstanceMgr> instance_mgr,
     std::unique_ptr<MooncakePrefixLookup> prefix_lookup)
     : LoadBalancePolicy(std::move(instance_mgr)),
       prefix_lookup_(std::move(prefix_lookup)) {}
 
-bool LeastTimePolicy::select_instances_pair(std::shared_ptr<Request> request) {
+bool DsLoadBalance::select_instances_pair(std::shared_ptr<Request> request) {
   // /v1/models uses the same scheduler with no generation payload.
   if (request->token_ids.empty()) {
     return instance_mgr_->get_next_instance_pair(&request->routing);
@@ -37,7 +37,7 @@ bool LeastTimePolicy::select_instances_pair(std::shared_ptr<Request> request) {
           ? prefix_lookup_->match(request->token_ids,
                                   instance_mgr_->get_instance_snapshot())
           : std::unordered_map<std::string, PrefillCacheHint>{};
-  return instance_mgr_->select_instance_pair_on_time(request, hints);
+  return instance_mgr_->select_instance_pair_on_ds_load_balance(request, hints);
 }
 
 }  // namespace xllm_service

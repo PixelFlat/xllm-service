@@ -27,7 +27,7 @@ limitations under the License.
 #include "loadbalance_policy/cache_aware_routing.h"
 #include "loadbalance_policy/round_robin.h"
 #include "loadbalance_policy/slo_aware_policy.h"
-#include "scheduler/loadbalance_policy/least_time_policy.h"
+#include "scheduler/loadbalance_policy/ds_load_balance.h"
 #include "scheduler/request_metrics.h"
 #include "scheduler/request_output.h"
 #include "tokenizer/tokenizer_factory.h"
@@ -128,10 +128,10 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
                                             kv_directory_.get(),
                                             options.car_host_hit_weight(),
                                             options.car_prefill_lambda());
-  } else if (options.load_balance_policy() == "LEAST_TIME") {
+  } else if (options.load_balance_policy() == "ds_load_balance") {
     CHECK_NE(options.default_backend_type(), "vllm")
-        << "LEAST_TIME requires service-side tokenization";
-    lb_policy_ = std::make_unique<LeastTimePolicy>(
+        << "ds_load_balance requires service-side tokenization";
+    lb_policy_ = std::make_unique<DsLoadBalance>(
         instance_mgr_,
         create_mooncake_prefix_lookup(options.mooncake_prefix_config_file()));
   } else if (options.load_balance_policy() == "SLO_AWARE") {
@@ -232,7 +232,7 @@ bool Scheduler::schedule(std::shared_ptr<Request> request) {
     return false;
   }
 
-  if (!request->time_routing_reserved &&
+  if (!request->ds_load_balance_reserved &&
       !instance_mgr_->bind_request_instance_incarnations(request)) {
     LOG(ERROR) << "Failed to bind request to instance incarnation ids. "
                << request->routing.debug_string();

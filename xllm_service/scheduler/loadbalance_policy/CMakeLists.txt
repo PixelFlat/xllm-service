@@ -10,13 +10,13 @@ cc_library(
     round_robin.h
     cache_aware_routing.h
     slo_aware_policy.h
-    least_time_policy.h
+    ds_load_balance.h
     mooncake_prefix_lookup.h
   SRCS
     round_robin.cpp
     cache_aware_routing.cpp
     slo_aware_policy.cpp
-    least_time_policy.cpp
+    ds_load_balance.cpp
     mooncake_prefix_lookup.cpp
   DEPS
     :chat_template
