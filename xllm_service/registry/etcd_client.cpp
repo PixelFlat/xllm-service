@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "discovery/etcd_client.h"
+#include "registry/etcd_client.h"
 
 #include <glog/logging.h>
 

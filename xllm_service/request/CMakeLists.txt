@@ -10,3 +10,9 @@ cc_library(
   SRCS request_preprocessor.cpp
   DEPS :request :chat_template :deepseek_v4_cpp_chat_template :model_type
 )
+cc_library(
+  NAME output_dispatcher
+  HDRS output_dispatcher.h
+  SRCS output_dispatcher.cpp
+  DEPS :common
+)

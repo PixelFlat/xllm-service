@@ -15,7 +15,7 @@
 """Unit tests for the InstanceMetaInfo / etcd-key Python mirror (no etcd needed).
 
 Guards against drift from the C++ source of truth:
-  * key layout / prefixes  -- discovery/instance_discovery.cpp kInstancePrefixes
+  * key layout / prefixes  -- registry/instance_discovery.cpp kInstancePrefixes
   * namespace normalization -- utils.cpp:105 normalize_etcd_namespace
   * required JSON fields    -- types.h:248 parse_from_json
 """

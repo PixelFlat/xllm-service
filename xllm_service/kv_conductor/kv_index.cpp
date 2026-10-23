@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kv_indexer/kv_index.h"
+#include "kv_conductor/kv_index.h"
 
 #include <glog/logging.h>
 #include <xxhash.h>

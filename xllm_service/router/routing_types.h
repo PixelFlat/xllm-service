@@ -20,7 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/types.h"
-#include "kv_indexer/kv_directory.h"
+#include "kv_conductor/kv_directory.h"
 
 namespace xllm_service {
 struct RoutingCandidate {

@@ -8,9 +8,9 @@ cc_library(
 )
 cc_library(
   NAME request_manager
-  HDRS request_manager.h output_dispatcher.h
-  SRCS request_manager.cpp output_dispatcher.cpp
-  DEPS :routing_state
+  HDRS request_manager.h
+  SRCS request_manager.cpp
+  DEPS :routing_state :output_dispatcher
 )
 cc_library(
   NAME router

@@ -18,7 +18,7 @@ limitations under the License.
 
 #include "cluster/instance_state.h"
 #include "config/service_config.h"
-#include "kv_indexer/kv_directory.h"
+#include "kv_conductor/kv_directory.h"
 #include "request/request_preprocessor.h"
 #include "router/routing_policy.h"
 #include "router/routing_state.h"

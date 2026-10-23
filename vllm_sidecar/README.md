@@ -41,11 +41,11 @@ long-running process that keeps registration in lockstep with vLLM's health.
 
 | step | code |
 |---|---|
-| watch `XLLM:DEFAULT:` etc. | `discovery/instance_discovery.cpp` `add_watch(prefix, ...)` |
+| watch `XLLM:DEFAULT:` etc. | `registry/instance_discovery.cpp` `add_watch(prefix, ...)` |
 | `PUT` → register | `cluster/instance_controller.cpp` `on_instance_event` → `register_instance` |
 | lease expiry → `DELETE` → probe → suspect/remove | `cluster/instance_controller.cpp` |
 | JSON schema | `common/types.h:248` `parse_from_json` (needs `name`,`rpc_address`,`type`) |
-| key prefix / namespace | `discovery/instance_discovery.cpp` prefixes, `common/utils.cpp` namespace |
+| key prefix / namespace | `registry/instance_discovery.cpp` prefixes, `common/utils.cpp` namespace |
 
 > **Constraint:** a single vLLM instance with no decode peer is routable only as
 > `type=DEFAULT (0)` — keep `--instance-type=DEFAULT`. This mirrors the M2 finding.

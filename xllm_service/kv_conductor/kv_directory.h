@@ -26,7 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "cluster/instance_types.h"
-#include "kv_indexer/kv_index.h"
+#include "kv_conductor/kv_index.h"
 
 namespace xllm_service {
 

@@ -18,7 +18,7 @@ limitations under the License.
 #include <atomic>
 #include <memory>
 
-#include "kv_indexer/kv_directory.h"
+#include "kv_conductor/kv_directory.h"
 #include "router/routing_policy.h"
 
 namespace xllm_service {

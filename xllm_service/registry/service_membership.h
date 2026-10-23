@@ -14,41 +14,41 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
 
-#include "cluster/instance_types.h"
 #include "common/threadpool.h"
-#include "discovery/etcd_client.h"
-
+#include "config/service_config.h"
+#include "registry/etcd_client.h"
 namespace xllm_service {
-class InstanceState;
-class InstanceDiscovery final {
+class ServiceMembership final {
  public:
-  using InstanceCallback = std::function<void(InstanceEvent)>;
-  using LoadCallback = std::function<void(LoadEvent)>;
-  InstanceDiscovery(std::shared_ptr<EtcdClient> etcd,
-                    std::shared_ptr<InstanceState> instances,
-                    InstanceCallback instance_callback,
-                    LoadCallback load_callback);
-  ~InstanceDiscovery();
-  void start(bool master);
+  ServiceMembership(const ServiceConfig& options,
+                    std::shared_ptr<EtcdClient> etcd,
+                    std::function<void()> on_master,
+                    std::function<void()> on_heartbeat);
+  ~ServiceMembership();
+  bool start();
   void stop();
-  void set_as_master();
-  bool upload_load_metrics();
+  bool is_master() const { return master_.load(); }
 
  private:
-  void handle_instances(const etcd::Response& response, uint64_t prefix_len);
-  void handle_load(const etcd::Response& response, uint64_t prefix_len);
+  bool register_current_service();
+  void elect_master();
+  void heartbeat_loop();
+  ServiceConfig options_;
   std::shared_ptr<EtcdClient> etcd_client_;
-  std::shared_ptr<InstanceState> instances_;
-  InstanceCallback instance_callback_;
-  LoadCallback load_callback_;
+  std::function<void()> on_master_;
+  std::function<void()> on_heartbeat_;
   std::atomic<bool> stopped_{true};
   std::atomic<bool> master_{false};
-  // Declared last: joins callbacks before their captures can be destroyed.
+  std::mutex stop_mutex_;
+  std::condition_variable stop_cv_;
+  std::unique_ptr<std::thread> heartbeat_;
   std::unique_ptr<ThreadPool> events_;
 };
 }  // namespace xllm_service

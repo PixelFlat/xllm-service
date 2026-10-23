@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kv_indexer/kv_directory.h"
+#include "kv_conductor/kv_directory.h"
 
 #include <glog/logging.h>
 #include <zmq.h>
@@ -30,7 +30,7 @@ limitations under the License.
 #include <unordered_map>
 #include <unordered_set>
 
-#include "kv_indexer/kv_event_decoder.h"
+#include "kv_conductor/kv_event_decoder.h"
 
 namespace xllm_service {
 namespace {

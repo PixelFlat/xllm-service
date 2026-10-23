@@ -17,12 +17,12 @@
 | 调度状态 | `router/routing_state.h/.cpp` | 服务侧请求/token 预留、时间预测、精确代际绑定及 SLO 调度状态提交 |
 | 实例控制 | `cluster/instance_controller.h/.cpp` | 注册、替换、健康检查、租约丢失宽限期、下线清理以及 P/D Link/Unlink |
 | 引擎客户端 | `cluster/instance_client.h/.cpp` | 按实例代际缓存 Channel；执行健康探测、P/D Link/Unlink 和推理请求提交 |
-| 实例发现 | `discovery/instance_discovery.h/.cpp` | etcd 初始状态和 watch 转换为类型化的实例/负载事件；异步串行消费 |
-| 服务成员 | `discovery/service_membership.h/.cpp` | 服务自身租约、主备选举和主服务负载发布 |
+| 实例发现 | `registry/instance_discovery.h/.cpp` | etcd 初始状态和 watch 转换为类型化的实例/负载事件；异步串行消费 |
+| 服务成员 | `registry/service_membership.h/.cpp` | 服务自身租约、主备选举和主服务负载发布 |
 | 请求生命周期 | `router/request_manager.h/.cpp` | 准入、请求存储、完成/取消、指标释放及停机取消 |
 | 预处理 | `request/request_preprocessor.h/.cpp`、`chat_message.h` | 模板渲染和分词；请求输入类型独立于 Jinja 实现 |
-| 有序输出 | `router/output_dispatcher.h/.cpp` | 按请求 ID 固定映射到串行队列，保证结果和取消事件的顺序 |
-| KV 索引 | `kv_indexer/` | 后台 ZMQ 订阅、replay/快照恢复、Host/Device 前缀索引；路由只读取本地目录 |
+| 有序输出 | `request/output_dispatcher.h/.cpp` | 按请求 ID 固定映射到串行队列，保证结果和取消事件的顺序 |
+| KV 索引 | `kv_conductor/` | 后台 ZMQ 订阅、replay/快照恢复、Host/Device 前缀索引；路由只读取本地目录 |
 | HTTP | `http_service/` | 请求协议解析、OpenAI/Anthropic 响应编码；`response_handler` 构造输出回调 |
 | RPC | `rpc_service/` | 心跳、实例信息和批量 Generations；消费引擎已解析的结构化结果 |
 

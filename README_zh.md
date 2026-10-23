@@ -45,11 +45,11 @@ xLLM-service 通过对计算资源池的动态管理、请求的智能调度与�
 ```
 xllm_service/
 ├── config/                # 启动配置
-├── router/                # 选路、请求生命周期与有序输出
+├── router/                # 选路与请求生命周期
 ├── cluster/               # 实例状态、健康与引擎客户端
-├── discovery/             # etcd 发现、服务租约与主备
-├── request/               # 请求数据与预处理
-├── kv_indexer/            # 异步 KV 事件消费和前缀索引
+├── registry/              # etcd 发现、服务租约与主备
+├── request/               # 请求数据、预处理与有序输出
+├── kv_conductor/          # 异步 KV 事件消费和前缀索引
 ├── http_service/          # HTTP 接口与响应编码
 ├── rpc_service/           # RPC 接口与结构化结果适配
 ├── chat_template/         # 对话模板

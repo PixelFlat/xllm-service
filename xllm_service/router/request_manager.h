@@ -18,8 +18,8 @@ limitations under the License.
 #include <mutex>
 #include <unordered_map>
 
+#include "request/output_dispatcher.h"
 #include "request/request.h"
-#include "router/output_dispatcher.h"
 namespace xllm_service {
 class InstanceState;
 class RoutingState;

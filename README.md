@@ -52,11 +52,11 @@ With management of computing resource pools, intelligent scheduling and preempti
 ```
 xllm_service/
 ├── config/                # Startup configuration
-├── router/                # Routing, request lifecycle and output
+├── router/                # Routing and request lifecycle
 ├── cluster/               # Instance state, health and engine clients
-├── discovery/             # etcd discovery and service membership
-├── request/               # Request data and preprocessing
-├── kv_indexer/            # Asynchronous KV events and prefix index
+├── registry/              # etcd discovery and service membership
+├── request/               # Request data, preprocessing and ordered output
+├── kv_conductor/          # Asynchronous KV events and prefix index
 ├── http_service/          # HTTP API and response encoding
 ├── rpc_service/           # RPC API and structured output adaptation
 ├── chat_template/         # Chat templates

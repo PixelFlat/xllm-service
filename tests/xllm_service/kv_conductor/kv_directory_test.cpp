@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "kv_indexer/kv_directory.h"
+#include "kv_conductor/kv_directory.h"
 
 #include <brpc/server.h>
 #include <glog/logging.h>
@@ -34,7 +34,7 @@ limitations under the License.
 #include <thread>
 
 #include "http_service/service.h"
-#include "kv_indexer/kv_event_decoder.h"
+#include "kv_conductor/kv_event_decoder.h"
 #include "router/policies/cache_aware_routing.h"
 #include "tests/xllm_service/service_test_peer.h"
 

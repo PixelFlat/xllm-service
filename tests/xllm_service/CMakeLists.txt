@@ -1,7 +1,7 @@
 add_subdirectory(chat_template)
 add_subdirectory(common)
 add_subdirectory(http_service)
-add_subdirectory(kv_indexer)
+add_subdirectory(kv_conductor)
 add_subdirectory(cluster)
 add_subdirectory(rpc_service)
 add_subdirectory(request)

@@ -22,9 +22,9 @@ limitations under the License.
 
 #include "cluster/instance_controller.h"
 #include "config/service_config.h"
-#include "discovery/instance_discovery.h"
-#include "discovery/service_membership.h"
 #include "http_service/service.h"
+#include "registry/instance_discovery.h"
+#include "registry/service_membership.h"
 #include "router/request_manager.h"
 #include "router/router.h"
 #include "rpc_service/service.h"
