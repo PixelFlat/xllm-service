@@ -28,19 +28,10 @@ limitations under the License.
 namespace xllm_service {
 namespace {
 
-struct SessionRoute {
-  InstanceIdentity prefill;
-  std::optional<InstanceIdentity> decode;
-};
-
 struct SessionSelection {
-  SessionRoute route;
+  Routing route;
   uint64_t version;
 };
-
-InstanceIdentity identity(const RoutingCandidate& candidate) {
-  return {candidate.name, candidate.incarnation_id, candidate.register_ts_ms};
-}
 
 const RoutingCandidate* find_candidate(
     const std::vector<RoutingCandidate>& candidates,
@@ -54,32 +45,32 @@ const RoutingCandidate* find_candidate(
 
 const RoutingCandidate* bound_candidate(
     const std::vector<RoutingCandidate>& candidates,
-    const InstanceIdentity& target) {
-  const auto* found = find_candidate(candidates, target.name);
-  return found != nullptr && same_instance_identity(target,
-                                                    found->name,
-                                                    found->incarnation_id,
-                                                    found->register_ts_ms)
+    const std::string& name,
+    const std::string& incarnation_id) {
+  const auto* found = find_candidate(candidates, name);
+  return found != nullptr && !incarnation_id.empty() &&
+                 found->incarnation_id == incarnation_id
              ? found
              : nullptr;
 }
 
-std::optional<SessionRoute> select_route(
-    const RoutingCandidates& candidates,
-    const SessionRoute* previous,
-    const std::optional<Routing>& proposal) {
-  const auto* prefill =
-      previous == nullptr
-          ? nullptr
-          : bound_candidate(candidates.prefill, previous->prefill);
-  const auto* decode =
-      previous == nullptr || !previous->decode
-          ? nullptr
-          : bound_candidate(candidates.decode, *previous->decode);
+std::optional<Routing> select_route(const RoutingCandidates& candidates,
+                                    const Routing* previous,
+                                    const std::optional<Routing>& proposal) {
+  const auto* prefill = previous == nullptr
+                            ? nullptr
+                            : bound_candidate(candidates.prefill,
+                                              previous->prefill_name,
+                                              previous->prefill_incarnation_id);
+  const auto* decode = previous == nullptr
+                           ? nullptr
+                           : bound_candidate(candidates.decode,
+                                             previous->decode_name,
+                                             previous->decode_incarnation_id);
   const bool complete =
       prefill != nullptr &&
-      (decode != nullptr ||
-       (!previous->decode && prefill->type == InstanceType::DEFAULT));
+      (decode != nullptr || (previous->decode_name.empty() &&
+                             prefill->type == InstanceType::DEFAULT));
   if (!complete) {
     if (!proposal) {
       return std::nullopt;
@@ -96,16 +87,27 @@ std::optional<SessionRoute> select_route(
       (decode == nullptr && prefill->type != InstanceType::DEFAULT)) {
     return std::nullopt;
   }
-  return SessionRoute{identity(*prefill),
-                      decode == nullptr
-                          ? std::nullopt
-                          : std::optional<InstanceIdentity>(identity(*decode))};
+  if (prefill->incarnation_id.empty() ||
+      (decode != nullptr && decode->incarnation_id.empty())) {
+    LOG(ERROR) << "Session affinity requires nonempty incarnation IDs for "
+                  "all selected instances";
+    return std::nullopt;
+  }
+  Routing route;
+  route.prefill_name = prefill->name;
+  route.prefill_incarnation_id = prefill->incarnation_id;
+  if (decode != nullptr) {
+    route.decode_name = decode->name;
+    route.decode_incarnation_id = decode->incarnation_id;
+  }
+  return route;
 }
 
-bool same_route(const SessionRoute& left, const SessionRoute& right) {
-  return same_instance_identity(left.prefill, right.prefill) &&
-         left.decode.has_value() == right.decode.has_value() &&
-         (!left.decode || same_instance_identity(*left.decode, *right.decode));
+bool same_route(const Routing& left, const Routing& right) {
+  return left.prefill_name == right.prefill_name &&
+         left.decode_name == right.decode_name &&
+         left.prefill_incarnation_id == right.prefill_incarnation_id &&
+         left.decode_incarnation_id == right.decode_incarnation_id;
 }
 
 }  // namespace
@@ -209,7 +211,7 @@ class SessionTable final {
 
  private:
   struct Binding {
-    SessionRoute route;
+    Routing route;
     uint64_t version = 0;
     uint64_t active = 0;
     bool committed = false;
@@ -305,11 +307,7 @@ bool SessionAwarePolicy::select_instances_pair(
   if (!selected) {
     return false;
   }
-  request->routing.prefill_name = selected->route.prefill.name;
-  request->routing.decode_name =
-      selected->route.decode ? selected->route.decode->name : "";
-  request->prefill_instance = std::move(selected->route.prefill);
-  request->decode_instance = std::move(selected->route.decode);
+  request->routing = std::move(selected->route);
   request->session_lease = std::shared_ptr<SessionLease>(
       new SessionLease(table_, std::move(key), selected->version));
   return true;

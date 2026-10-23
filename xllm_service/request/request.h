@@ -18,11 +18,9 @@ limitations under the License.
 #include <absl/time/time.h>
 
 #include <cstdint>
-#include <optional>
 
 #include "chat_template/jinja_chat_template.h"
 #include "common/call_data.h"
-#include "common/instance_identity.h"
 #include "common/types.h"
 #include "common/xllm/output.h"
 
@@ -70,8 +68,6 @@ struct Request {
 
   // instance routing
   Routing routing;
-  std::optional<InstanceIdentity> prefill_instance;
-  std::optional<InstanceIdentity> decode_instance;
 
   // prefill stage finished
   bool prefill_stage_finished = false;

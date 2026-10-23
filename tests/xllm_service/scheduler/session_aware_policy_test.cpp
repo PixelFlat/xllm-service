@@ -308,73 +308,78 @@ TEST_F(SessionAwarePolicyTest, ReplacementFencesOldCompletions) {
   EXPECT_EQ(after_error->routing.prefill_name, "A");
 }
 
-TEST_F(SessionAwarePolicyTest, LegacyReplacementFencesRequests) {
-  auto p = instance("P", InstanceType::PREFILL, "");
-  auto d = instance("D", InstanceType::DECODE, "");
-  p.register_ts_ms = 0;
-  d.register_ts_ms = 0;
-  SchedulerTestPeer::instances(*manager_, {p, d});
-  auto scheduler = SchedulerTestPeer::scheduler(nullptr, manager_);
-  for (auto* changed : {&p, &d}) {
-    auto old = route("legacy");
-    ASSERT_NE(old, nullptr);
-    old->session_lease->commit();
-    ASSERT_TRUE(old->prefill_instance.has_value());
-    ASSERT_TRUE(old->decode_instance.has_value());
-    EXPECT_EQ(old->prefill_instance->register_ts_ms, p.register_ts_ms);
-    EXPECT_EQ(old->decode_instance->register_ts_ms, d.register_ts_ms);
-    ++changed->register_ts_ms;
-    SchedulerTestPeer::instances(*manager_, {p, d});
-    EXPECT_FALSE(manager_->bind_request_instances(old));
-    EXPECT_FALSE(manager_->request_instances_match(*old));
-    EXPECT_FALSE(SchedulerTestPeer::publish(*scheduler, old));
-    auto replacement = route("legacy");
-    ASSERT_NO_FATAL_FAILURE(complete(replacement));
-    old->session_lease->finish(/*failed=*/true);
-    auto repeated = route("legacy");
-    ASSERT_NE(repeated, nullptr);
-    ASSERT_TRUE(repeated->prefill_instance.has_value());
-    ASSERT_TRUE(repeated->decode_instance.has_value());
-    EXPECT_EQ(repeated->prefill_instance->register_ts_ms, p.register_ts_ms);
-    EXPECT_EQ(repeated->decode_instance->register_ts_ms, d.register_ts_ms);
-    ASSERT_NO_FATAL_FAILURE(complete(repeated));
+TEST_F(SessionAwarePolicyTest, SessionBindingRequiresIncarnationIds) {
+  const std::vector<std::vector<InstanceMetaInfo>> cases = {
+      {instance("A", InstanceType::DEFAULT, "")},
+      {instance("P", InstanceType::PREFILL, ""),
+       instance("D", InstanceType::DECODE, "decode")},
+      {instance("P", InstanceType::PREFILL, "prefill"),
+       instance("D", InstanceType::DECODE, "")}};
+  for (auto instances : cases) {
+    SchedulerTestPeer::instances(*manager_, instances);
+    policy_ = make_policy(/*capacity=*/64);
+    auto rejected = request("missing-id");
+    EXPECT_FALSE(policy_->select_instances_pair(rejected));
+    EXPECT_EQ(rejected->session_lease, nullptr);
+    // Engines without IDs remain usable through ordinary placement.
+    EXPECT_NE(route(""), nullptr);
+
+    for (auto& info : instances) {
+      info.incarnation_id = info.name + "-ready";
+    }
+    SchedulerTestPeer::instances(*manager_, instances);
+    auto ready = route("missing-id");
+    ASSERT_NO_FATAL_FAILURE(complete(ready));
+    EXPECT_EQ(ready->routing.prefill_incarnation_id,
+              ready->routing.prefill_name + "-ready");
+    if (!ready->routing.decode_name.empty()) {
+      EXPECT_EQ(ready->routing.decode_incarnation_id,
+                ready->routing.decode_name + "-ready");
+    }
   }
 }
 
 TEST_F(SessionAwarePolicyTest, ChannelLookupRejectsReplacedTargets) {
-  for (const bool legacy : {false, true}) {
-    auto p = instance("P", InstanceType::PREFILL, legacy ? "" : "prefill-old");
-    auto d = instance("D", InstanceType::DECODE, legacy ? "" : "decode-old");
+  auto p = instance("P", InstanceType::PREFILL, "prefill-old");
+  auto d = instance("D", InstanceType::DECODE, "decode-old");
+  SchedulerTestPeer::instances(*manager_, {p, d});
+  auto channel = std::make_shared<brpc::Channel>();
+  SchedulerTestPeer::channel(*manager_, p.name, channel);
+  auto scheduler = SchedulerTestPeer::scheduler(nullptr, manager_);
+  for (auto* changed : {&p, &d}) {
+    auto old = route("dispatch");
+    ASSERT_NE(old, nullptr);
+    EXPECT_EQ(scheduler->get_channel(*old), channel);
+    ++changed->register_ts_ms;
     SchedulerTestPeer::instances(*manager_, {p, d});
-    policy_ = make_policy(/*capacity=*/64);
-    auto channel = std::make_shared<brpc::Channel>();
+    // Re-registration of the same process must preserve the existing binding.
+    EXPECT_EQ(scheduler->get_channel(*old), channel);
+    auto refreshed = route("dispatch");
+    ASSERT_NO_FATAL_FAILURE(complete(refreshed));
+    EXPECT_EQ(refreshed->routing.prefill_incarnation_id,
+              old->routing.prefill_incarnation_id);
+    EXPECT_EQ(refreshed->routing.decode_incarnation_id,
+              old->routing.decode_incarnation_id);
+
+    changed->incarnation_id += "-new";
+    SchedulerTestPeer::instances(*manager_, {p, d});
+    channel = std::make_shared<brpc::Channel>();
     SchedulerTestPeer::channel(*manager_, p.name, channel);
-    auto scheduler = SchedulerTestPeer::scheduler(nullptr, manager_);
-    for (auto* changed : {&p, &d}) {
-      auto old = route("dispatch");
-      ASSERT_NE(old, nullptr);
-      EXPECT_EQ(scheduler->get_channel(*old), channel);
-      if (legacy) {
-        ++changed->register_ts_ms;
-      } else {
-        changed->incarnation_id += "-new";
-      }
-      SchedulerTestPeer::instances(*manager_, {p, d});
-      channel = std::make_shared<brpc::Channel>();
-      SchedulerTestPeer::channel(*manager_, p.name, channel);
-      // Lookup must not return the new Channel for the previously bound route,
-      // including when only the Decode peer was replaced.
-      EXPECT_EQ(scheduler->get_channel(*old), nullptr);
-      auto current = route("dispatch");
-      ASSERT_NE(current, nullptr);
-      EXPECT_EQ(scheduler->get_channel(*current), channel);
-      ASSERT_NO_FATAL_FAILURE(complete(current));
-      old->session_lease->finish(/*failed=*/true);
-      auto repeated = route("dispatch");
-      ASSERT_NE(repeated, nullptr);
-      EXPECT_EQ(scheduler->get_channel(*repeated), channel);
-      ASSERT_NO_FATAL_FAILURE(complete(repeated));
-    }
+    // Lookup must not return the new Channel for the previously bound route,
+    // including when only the Decode peer was replaced.
+    EXPECT_FALSE(manager_->bind_request_instances(old));
+    EXPECT_FALSE(manager_->request_instances_match(*old));
+    EXPECT_FALSE(SchedulerTestPeer::publish(*scheduler, old));
+    EXPECT_EQ(scheduler->get_channel(*old), nullptr);
+    auto current = route("dispatch");
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(scheduler->get_channel(*current), channel);
+    ASSERT_NO_FATAL_FAILURE(complete(current));
+    old->session_lease->finish(/*failed=*/true);
+    auto repeated = route("dispatch");
+    ASSERT_NE(repeated, nullptr);
+    EXPECT_EQ(scheduler->get_channel(*repeated), channel);
+    ASSERT_NO_FATAL_FAILURE(complete(repeated));
   }
 }
 

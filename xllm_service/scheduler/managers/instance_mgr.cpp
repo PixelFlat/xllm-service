@@ -27,7 +27,6 @@ limitations under the License.
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,14 +65,6 @@ uint64_t current_time_ms() {
 bool is_instance_schedulable(const xllm_service::InstanceMetaInfo& info) {
   // LEASE_LOST instances can still be reused while heartbeats continue.
   return info.runtime_state != InstanceRuntimeState::SUSPECT;
-}
-
-bool matches_instance_identity(
-    const xllm_service::InstanceMetaInfo& info,
-    const std::optional<xllm_service::InstanceIdentity>& selected) {
-  return selected &&
-         xllm_service::same_instance_identity(
-             *selected, info.name, info.incarnation_id, info.register_ts_ms);
 }
 
 bool select_next_schedulable_instance(
@@ -240,7 +231,7 @@ bool InstanceMgr::get_next_instance_pair(Routing* routing) {
     return false;
   }
 
-  routing->decode_name.clear();
+  *routing = {};
   if (suspect_instances_.empty()) {
     // Fast path for the common case: no suspect instances, keep plain RR.
     next_prefill_index_ = next_prefill_index_ % prefill_index_.size();
@@ -400,45 +391,46 @@ bool InstanceMgr::bind_request_instances(
     const std::shared_ptr<Request>& request) {
   std::shared_lock<std::shared_mutex> lock(cluster_mutex_);
   const auto bind = [this](const std::string& name,
-                           std::optional<InstanceIdentity>& selected) {
+                           std::string& incarnation_id) {
     if (name.empty()) {
-      selected.reset();
+      incarnation_id.clear();
       return true;
     }
     const auto found = instances_.find(name);
     if (found == instances_.end() || !is_instance_schedulable(found->second) ||
-        (selected && !matches_instance_identity(found->second, selected))) {
+        (!incarnation_id.empty() &&
+         found->second.incarnation_id != incarnation_id)) {
       return false;
     }
-    const auto& info = found->second;
-    selected =
-        InstanceIdentity{info.name, info.incarnation_id, info.register_ts_ms};
+    incarnation_id = found->second.incarnation_id;
     return true;
   };
-  auto prefill = request->prefill_instance;
-  auto decode = request->decode_instance;
+  std::string prefill = request->routing.prefill_incarnation_id;
+  std::string decode = request->routing.decode_incarnation_id;
   if (!bind(request->routing.prefill_name, prefill) ||
       !bind(request->routing.decode_name, decode)) {
     return false;
   }
-  request->prefill_instance = std::move(prefill);
-  request->decode_instance = std::move(decode);
+  request->routing.prefill_incarnation_id = std::move(prefill);
+  request->routing.decode_incarnation_id = std::move(decode);
   return true;
 }
 
 bool InstanceMgr::request_instances_match_locked(const Request& request) const {
   const auto matches = [this](const std::string& name,
-                              const std::optional<InstanceIdentity>& selected) {
+                              const std::string& incarnation_id) {
     if (name.empty()) {
-      return !selected.has_value();
+      return incarnation_id.empty();
     }
     const auto found = instances_.find(name);
     return found != instances_.end() &&
            is_instance_schedulable(found->second) &&
-           matches_instance_identity(found->second, selected);
+           found->second.incarnation_id == incarnation_id;
   };
-  return matches(request.routing.prefill_name, request.prefill_instance) &&
-         matches(request.routing.decode_name, request.decode_instance);
+  return matches(request.routing.prefill_name,
+                 request.routing.prefill_incarnation_id) &&
+         matches(request.routing.decode_name,
+                 request.routing.decode_incarnation_id);
 }
 
 bool InstanceMgr::request_instances_match(const Request& request) const {
@@ -847,16 +839,16 @@ void InstanceMgr::update_request_metrics(
   auto prefill_instance = instances_.find(request->routing.prefill_name);
   if (prefill_it != request_metrics_.end() &&
       prefill_instance != instances_.end() &&
-      matches_instance_identity(prefill_instance->second,
-                                request->prefill_instance)) {
+      prefill_instance->second.incarnation_id ==
+          request->routing.prefill_incarnation_id) {
     apply_prefill_request_metrics(*request, action, prefill_it->second);
   }
   auto decode_it = request_metrics_.find(request->routing.decode_name);
   auto decode_instance = instances_.find(request->routing.decode_name);
   if (decode_it != request_metrics_.end() &&
       decode_instance != instances_.end() &&
-      matches_instance_identity(decode_instance->second,
-                                request->decode_instance)) {
+      decode_instance->second.incarnation_id ==
+          request->routing.decode_incarnation_id) {
     apply_decode_request_metrics(*request, action, decode_it->second);
     if (decode_it->second.decode_request_num == 0) {
       flip_decode_to_prefill(request->routing.decode_name);
@@ -1212,8 +1204,7 @@ void InstanceMgr::deregister_instance(
   }
 
   scheduler_->clear_requests_on_failed_instance(
-      InstanceIdentity{name, info.incarnation_id, info.register_ts_ms},
-      get_cleanup_type(info));
+      name, info.incarnation_id, get_cleanup_type(info));
 
   {
     std::unique_lock<std::shared_mutex> lock(cluster_mutex_);

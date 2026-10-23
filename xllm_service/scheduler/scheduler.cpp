@@ -526,7 +526,8 @@ void Scheduler::finish_request(const std::string& service_request_id,
 }
 
 void Scheduler::clear_requests_on_failed_instance(
-    const InstanceIdentity& instance,
+    const std::string& instance_name,
+    const std::string& incarnation_id,
     InstanceType type) {
   std::vector<std::shared_ptr<Request>> cleared_requests;
   {
@@ -534,12 +535,13 @@ void Scheduler::clear_requests_on_failed_instance(
     for (const auto& [service_request_id, request] : requests_) {
       const bool clear_prefill =
           ((type == InstanceType::DEFAULT || type == InstanceType::PREFILL) &&
-           request->prefill_instance &&
-           same_instance_identity(*request->prefill_instance, instance) &&
+           request->routing.prefill_name == instance_name &&
+           request->routing.prefill_incarnation_id == incarnation_id &&
            !request->prefill_stage_finished);
       const bool clear_decode =
-          (type == InstanceType::DECODE && request->decode_instance &&
-           same_instance_identity(*request->decode_instance, instance));
+          (type == InstanceType::DECODE &&
+           request->routing.decode_name == instance_name &&
+           request->routing.decode_incarnation_id == incarnation_id);
       if (!clear_prefill && !clear_decode) {
         continue;
       }
@@ -552,8 +554,8 @@ void Scheduler::clear_requests_on_failed_instance(
     output.status = llm::Status(llm::StatusCode::CANCELLED,
                                 "Instance is failed and deleted");
     handle_generation(std::move(output));
-    LOG(INFO) << "Clear request on failed instance: " << instance.name
-              << ", incarnation_id: " << instance.incarnation_id
+    LOG(INFO) << "Clear request on failed instance: " << instance_name
+              << ", incarnation_id: " << incarnation_id
               << ", service_request_id: " << request->service_request_id;
   }
 }

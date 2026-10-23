@@ -9,7 +9,6 @@ cc_library(
     closure_guard.h
     concurrent_queue.h
     global_gflags.h
-    instance_identity.h
     json_reader.h
     macros.h
     slice.h
